@@ -1,3 +1,5 @@
+### Welcome! This is an easy to use installer that helps you set up Steam, WiVRn, WayVR, Proton-GE-RTSP, and VRChat on any Debian based system. Be sure to have your graphics driver properly installed and setup first! 
+
 
 ### To install Steam, VRChat, WiVRn, Proton-GE-RTSP, and optionally WayVR:
 
