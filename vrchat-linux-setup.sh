@@ -875,6 +875,63 @@ close_steam_for_setup() {
   fi
 }
 
+ensure_steam_closed_for_update() {
+  if ! pgrep -u "$REAL_USER" -x steam >/dev/null 2>&1 \
+    && ! pgrep -u "$REAL_USER" -x steamwebhelper >/dev/null 2>&1 \
+    && ! pgrep -u "$REAL_USER" -x pressure-vessel >/dev/null 2>&1 \
+    && ! pgrep -u "$REAL_USER" -x wineserver >/dev/null 2>&1; then
+    return 0
+  fi
+
+  say
+  say "Steam or related Proton helper processes are still running."
+  say "Proton-GE-RTSP updates need Steam closed before the update can continue."
+
+  if ! prompt_yes_no "Close Steam automatically now and continue the Proton-GE-RTSP update?" "Y"; then
+    say "Skipping Proton-GE-RTSP update because Steam was left running."
+    return 1
+  fi
+
+  local names=(steam steamwebhelper pressure-vessel wineserver)
+  local name=""
+  local tries=0
+
+  say
+  say "Closing Steam so the Proton-GE-RTSP update can continue..."
+
+  for name in "${names[@]}"; do
+    pkill -u "$REAL_USER" -TERM -x "$name" 2>/dev/null || true
+  done
+
+  for tries in {1..20}; do
+    if ! pgrep -u "$REAL_USER" -x steam >/dev/null 2>&1 \
+      && ! pgrep -u "$REAL_USER" -x steamwebhelper >/dev/null 2>&1 \
+      && ! pgrep -u "$REAL_USER" -x pressure-vessel >/dev/null 2>&1 \
+      && ! pgrep -u "$REAL_USER" -x wineserver >/dev/null 2>&1; then
+      say "Steam closed."
+      return 0
+    fi
+    sleep 1
+  done
+
+  warn "Steam did not exit cleanly. Forcing shutdown..."
+
+  for name in "${names[@]}"; do
+    pkill -u "$REAL_USER" -KILL -x "$name" 2>/dev/null || true
+  done
+
+  sleep 2
+
+  if pgrep -u "$REAL_USER" -x steam >/dev/null 2>&1 \
+    || pgrep -u "$REAL_USER" -x steamwebhelper >/dev/null 2>&1 \
+    || pgrep -u "$REAL_USER" -x pressure-vessel >/dev/null 2>&1 \
+    || pgrep -u "$REAL_USER" -x wineserver >/dev/null 2>&1; then
+    die "Steam could not be closed automatically. Close it manually, then re-run the update."
+  fi
+
+  say "Steam closed."
+}
+
 prompt_steam_login() {
   if steam_is_initialized; then
     say "Steam already looks initialized and signed in enough for configuration. Skipping first-run/login."
@@ -1260,6 +1317,7 @@ print_status() {
 
 update_mode() {
   detect_steam
+
   if run_in_user_shell "flatpak info $WIVRN_FLATPAK_ID >/dev/null 2>&1"; then
     say "Checking for WiVRn Flatpak updates..."
     run_as_user flatpak update -y "$WIVRN_FLATPAK_ID" || warn "WiVRn Flatpak update failed."
@@ -1270,17 +1328,24 @@ update_mode() {
     local rtsp_dest="$STEAM_ROOT/compatibilitytools.d/$RTSP_TOOL_NAME"
     local existing_rtsp=""
     existing_rtsp="$(installed_rtsp_versions || true)"
+
     if [[ -d "$rtsp_dest" ]]; then
       say "Proton-GE-RTSP is already at the latest detected version: $RTSP_TAG"
     else
       if [[ -n "$existing_rtsp" ]]; then
         say "Detected older Proton-GE-RTSP install(s):"
         printf '%s\n' "$existing_rtsp" | sed 's/^/  - /'
+      else
+        say "Proton-GE-RTSP is not currently installed."
       fi
+
       if prompt_yes_no "Install/update Proton-GE-RTSP to $RTSP_TAG?" "Y"; then
-        install_rtsp
-        if prompt_yes_no "Update Steam's VRChat compatibility selection to $RTSP_TAG now?" "Y"; then
-          configure_steam_for_vrchat
+        if ensure_steam_closed_for_update; then
+          install_rtsp
+
+          if prompt_yes_no "Update Steam's VRChat compatibility selection to $RTSP_TAG now?" "Y"; then
+            configure_steam_for_vrchat
+          fi
         fi
       fi
     fi
@@ -1290,6 +1355,7 @@ update_mode() {
     fetch_wayvr_release
     local installed_wayvr=""
     installed_wayvr="$(cat "$STATE_DIR/wayvr-version.txt" 2>/dev/null || true)"
+
     if [[ "$installed_wayvr" == "$WAYVR_TAG" ]]; then
       say "WayVR is already at the latest detected version: $WAYVR_TAG"
     else
