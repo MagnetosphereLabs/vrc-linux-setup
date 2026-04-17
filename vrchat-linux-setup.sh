@@ -93,7 +93,12 @@ sudo_do() {
 }
 
 pause_prompt() {
-  read -r -p "$1" _reply || exit 1
+  local _reply=""
+  if [[ -r /dev/tty ]]; then
+    read -r -p "$1" _reply </dev/tty || exit 1
+  else
+    read -r -p "$1" _reply || exit 1
+  fi
 }
 
 prompt_yes_no() {
@@ -105,7 +110,11 @@ prompt_yes_no() {
   [[ "$default" == "N" ]] && suffix="[y/N]"
 
   while true; do
-    read -r -p "$prompt $suffix " reply || exit 1
+    if [[ -r /dev/tty ]]; then
+      read -r -p "$prompt $suffix " reply </dev/tty || exit 1
+    else
+      read -r -p "$prompt $suffix " reply || exit 1
+    fi
     reply="${reply:-$default}"
     case "$reply" in
       [Yy]|[Yy][Ee][Ss]) return 0 ;;
@@ -1229,10 +1238,16 @@ print_status() {
     say "WiVRn:         not installed"
   fi
   say "VRChat:        $VRCHAT_INSTALLED"
+  local existing_rtsp=""
+  existing_rtsp="$(installed_rtsp_versions || true)"
+
   say "RTSP release:  $RTSP_TAG"
   say "RTSP tool:     $RTSP_TOOL_NAME"
   if [[ -n "$STEAM_ROOT" && -d "$STEAM_ROOT/compatibilitytools.d/$RTSP_TOOL_NAME" ]]; then
-    say "RTSP status:   installed"
+    say "RTSP status:   installed (latest)"
+  elif [[ -n "$existing_rtsp" ]]; then
+    say "RTSP status:   older version(s) installed"
+    printf '%s\n' "$existing_rtsp" | sed 's/^/RTSP found:    /'
   else
     say "RTSP status:   not installed"
   fi
@@ -1253,9 +1268,15 @@ update_mode() {
   fetch_rtsp_release
   if [[ -n "$STEAM_ROOT" ]]; then
     local rtsp_dest="$STEAM_ROOT/compatibilitytools.d/$RTSP_TOOL_NAME"
+    local existing_rtsp=""
+    existing_rtsp="$(installed_rtsp_versions || true)"
     if [[ -d "$rtsp_dest" ]]; then
       say "Proton-GE-RTSP is already at the latest detected version: $RTSP_TAG"
     else
+      if [[ -n "$existing_rtsp" ]]; then
+        say "Detected older Proton-GE-RTSP install(s):"
+        printf '%s\n' "$existing_rtsp" | sed 's/^/  - /'
+      fi
       if prompt_yes_no "Install/update Proton-GE-RTSP to $RTSP_TAG?" "Y"; then
         install_rtsp
         if prompt_yes_no "Update Steam's VRChat compatibility selection to $RTSP_TAG now?" "Y"; then
