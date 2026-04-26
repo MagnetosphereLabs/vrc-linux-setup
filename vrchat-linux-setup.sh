@@ -232,10 +232,10 @@ require_supported_os() {
     die "Could not detect your operating system."
   fi
 
-  case "$OS_ID" in
-    ubuntu|debian|pop) ;;
+  case "$OS_ID ${ID_LIKE:-}" in
+    linuxmint*|*ubuntu*|*debian*|*pop*) ;;
     *)
-      die "This script targets Debian-based systems such as Pop!_OS, Ubuntu, and Debian. Detected: $OS_NAME"
+      die "This script targets Debian based systems such as Pop!_OS, Ubuntu, Debian, and Linux Mint. Detected: $OS_NAME"
       ;;
   esac
 }
