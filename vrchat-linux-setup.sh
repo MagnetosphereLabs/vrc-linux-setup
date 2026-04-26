@@ -457,8 +457,8 @@ ensure_wivrn() {
     say "  Source:  $WIVRN_KIND"
     say "  Version: ${WIVRN_VERSION:-unknown}"
   else
-    say "Installing WiVRn from Flathub..."
-    run_as_user flatpak install -y flathub "$WIVRN_FLATPAK_ID"
+    say "Installing WiVRn from Flathub system-wide..."
+    sudo_do flatpak install -y --system flathub "$WIVRN_FLATPAK_ID"
     detect_wivrn
   fi
 
@@ -1318,9 +1318,12 @@ print_status() {
 update_mode() {
   detect_steam
 
-  if run_in_user_shell "flatpak info $WIVRN_FLATPAK_ID >/dev/null 2>&1"; then
+  if flatpak info --system "$WIVRN_FLATPAK_ID" >/dev/null 2>&1; then
     say "Checking for WiVRn Flatpak updates..."
-    run_as_user flatpak update -y "$WIVRN_FLATPAK_ID" || warn "WiVRn Flatpak update failed."
+    sudo_do flatpak update -y --system "$WIVRN_FLATPAK_ID" || warn "WiVRn Flatpak update failed."
+  elif run_as_user flatpak info --user "$WIVRN_FLATPAK_ID" >/dev/null 2>&1; then
+    say "Checking for WiVRn Flatpak updates..."
+    run_as_user flatpak update -y --user "$WIVRN_FLATPAK_ID" || warn "WiVRn Flatpak update failed."
   fi
 
   fetch_rtsp_release
