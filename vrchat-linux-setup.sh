@@ -4,6 +4,12 @@ set -Eeuo pipefail
 SCRIPT_NAME="$(basename "$0")"
 SCRIPT_VERSION="0.1.0"
 RTSP_REPO="SpookySkeletons/proton-ge-rtsp"
+
+# Proton-GE-RTSP release channel.
+# prerelease = newest GitHub pre-release
+# latest     = normal GitHub latest release
+RTSP_RELEASE_CHANNEL="${RTSP_RELEASE_CHANNEL:-prerelease}"
+
 WAYVR_REPO="wayvr-org/wayvr"
 VRCHAT_APPID="438100"
 DEFAULT_NATIVE_VR_LAUNCH='PRESSURE_VESSEL_IMPORT_OPENXR_1_RUNTIMES=1 PRESSURE_VESSEL_FILESYSTEMS_RW=/var/lib/flatpak/app/io.github.wivrn.wivrn %command%'
@@ -619,17 +625,46 @@ check_gpu() {
 fetch_github_release() {
   local repo="$1"
   local kind="$2"
-  local tmp
+  local tmp api_url
   tmp="$(mktemp)"
-  curl -fsSL "https://api.github.com/repos/${repo}/releases/latest" -o "$tmp"
+
+  if [[ "$kind" == "rtsp" && "${RTSP_RELEASE_CHANNEL:-prerelease}" == "prerelease" ]]; then
+    api_url="https://api.github.com/repos/${repo}/releases?per_page=30"
+  else
+    api_url="https://api.github.com/repos/${repo}/releases/latest"
+  fi
+
+  curl -fsSL "$api_url" -o "$tmp"
 
   if [[ "$kind" == "rtsp" ]]; then
-    mapfile -t _fields < <(python3 - "$tmp" <<'PY'
+    mapfile -t _fields < <(python3 - "$tmp" "${RTSP_RELEASE_CHANNEL:-prerelease}" <<'PY'
 import json
 import sys
 
 with open(sys.argv[1], encoding='utf-8') as f:
-    data = json.load(f)
+    raw = json.load(f)
+
+channel = sys.argv[2]
+data = None
+
+if isinstance(raw, list):
+    candidates = [
+        r for r in raw
+        if not r.get('draft')
+        and r.get('prerelease')
+        and any((a.get('name') or '').endswith('.tar.gz') for a in r.get('assets', []))
+    ]
+
+    if not candidates:
+        raise SystemExit('Could not determine latest Proton-GE-RTSP pre-release with a .tar.gz asset.')
+
+    candidates.sort(
+        key=lambda r: r.get('published_at') or r.get('created_at') or '',
+        reverse=True,
+    )
+    data = candidates[0]
+else:
+    data = raw
 
 body = (data.get('body') or '').strip()
 tag = data.get('tag_name') or ''
