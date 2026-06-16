@@ -3,16 +3,24 @@ set -Eeuo pipefail
 
 SCRIPT_NAME="$(basename "$0")"
 SCRIPT_VERSION="0.1.0"
-RTSP_REPO="SpookySkeletons/proton-ge-rtsp"
+RTSP_REPO="MagnetosphereLabs/proton-ge-rtsp"
+
+# Build our forked Proton-GE-RTSP locally instead of downloading a release tarball.
+RTSP_BUILD_FROM_SOURCE="${RTSP_BUILD_FROM_SOURCE:-1}"
+RTSP_SOURCE_REPO_URL="${RTSP_SOURCE_REPO_URL:-https://github.com/MagnetosphereLabs/proton-ge-rtsp.git}"
+RTSP_SOURCE_REF="${RTSP_SOURCE_REF:-vrc-mic-capture-buffer}"
+RTSP_BUILD_NAME="${RTSP_BUILD_NAME:-GE-Proton10-33-rtsp24-1-vrcmic1}"
+RTSP_BUILD_DIR_REL=".local/share/vrchat-linux-setup/proton-ge-rtsp-build"
 
 # Proton-GE-RTSP release channel.
+# Only used when RTSP_BUILD_FROM_SOURCE=0.
 # prerelease = newest GitHub pre-release
 # latest     = normal GitHub latest release
 RTSP_RELEASE_CHANNEL="${RTSP_RELEASE_CHANNEL:-prerelease}"
 
 WAYVR_REPO="wayvr-org/wayvr"
 VRCHAT_APPID="438100"
-DEFAULT_NATIVE_VR_LAUNCH='PRESSURE_VESSEL_IMPORT_OPENXR_1_RUNTIMES=1 PRESSURE_VESSEL_FILESYSTEMS_RW=/var/lib/flatpak/app/io.github.wivrn.wivrn %command%'
+DEFAULT_NATIVE_VR_LAUNCH='WINEPULSE_FAST_POLLING=1 WINEPULSE_CAPTURE_BUFFER_MS=2000 WINEDEBUG=-all PRESSURE_VESSEL_IMPORT_OPENXR_1_RUNTIMES=1 PRESSURE_VESSEL_FILESYSTEMS_RW=/var/lib/flatpak/app/io.github.wivrn.wivrn %command%'
 STATE_DIR_REL=".local/share/vrchat-linux-setup"
 WAYVR_BIN_REL=".local/bin/WayVR.AppImage"
 WAYVR_DESKTOP_REL=".local/share/applications/wayvr.desktop"
@@ -265,14 +273,18 @@ resolve_real_user() {
 need_cmds() {
   local missing=()
   local cmd
-  for cmd in curl python3 tar awk sed grep findmnt getent lspci; do
+
+  for cmd in curl python3 tar awk sed grep findmnt getent lspci git make gcc g++; do
     have "$cmd" || missing+=("$cmd")
   done
 
   if ((${#missing[@]})); then
-    say "Installing required base packages: ${missing[*]}"
+    say "Installing required base/build packages: ${missing[*]}"
     sudo_do apt-get update
-    sudo_do apt-get install -y curl python3 tar pciutils util-linux gawk sed grep coreutils findutils
+    sudo_do apt-get install -y \
+      curl python3 tar pciutils util-linux gawk sed grep coreutils findutils \
+      git make gcc g++ build-essential ca-certificates pkg-config autoconf automake \
+      libtool bison flex meson ninja-build cmake
   fi
 }
 
@@ -736,8 +748,93 @@ PY
   rm -f "$tmp"
 }
 
+set_local_rtsp_build_release_info() {
+  RTSP_TAG="$RTSP_SOURCE_REF"
+  RTSP_ASSET_NAME="$RTSP_BUILD_NAME.tar.gz"
+  RTSP_TOOL_NAME="$RTSP_BUILD_NAME"
+  RTSP_URL="$RTSP_SOURCE_REPO_URL"
+  RTSP_SHA_URL=""
+  RTSP_RELEASE_URL="${RTSP_SOURCE_REPO_URL%.git}/tree/$RTSP_SOURCE_REF"
+  RTSP_NOTES="Local source build from $RTSP_SOURCE_REPO_URL ref $RTSP_SOURCE_REF"
+}
+
+build_install_rtsp_from_source() {
+  local force="${1:-0}"
+
+  set_local_rtsp_build_release_info
+  detect_steam
+  [[ -n "$STEAM_ROOT" ]] || die "Steam must be installed before Proton-GE-RTSP can be installed."
+
+  local dest="$STEAM_ROOT/compatibilitytools.d"
+  local current_dir="$dest/$RTSP_TOOL_NAME"
+  local build_parent="$REAL_HOME/$RTSP_BUILD_DIR_REL"
+  local src_dir="$build_parent/source"
+  local build_dir="$build_parent/build"
+  local archive="$build_dir/$RTSP_BUILD_NAME.tar.gz"
+
+  run_as_user mkdir -p "$dest" "$build_parent"
+  check_steam_not_running
+
+  if [[ -d "$current_dir" ]]; then
+    if [[ "$force" == "1" ]]; then
+      say "Rebuilding/reinstalling local Proton-GE-RTSP: $RTSP_TOOL_NAME"
+      run_as_user rm -rf "$current_dir"
+    else
+      say "$RTSP_TOOL_NAME is already installed."
+      say "Run repair-install and choose reinstall if you want to rebuild it."
+      return 0
+    fi
+  fi
+
+  say "Preparing local Proton-GE-RTSP source build..."
+  say "  Repo:   $RTSP_SOURCE_REPO_URL"
+  say "  Ref:    $RTSP_SOURCE_REF"
+  say "  Name:   $RTSP_BUILD_NAME"
+  say "  Build:  $build_parent"
+
+  run_as_user rm -rf "$src_dir" "$build_dir"
+
+  say "Cloning Proton source and submodules..."
+  run_as_user git clone --recurse-submodules --branch "$RTSP_SOURCE_REF" "$RTSP_SOURCE_REPO_URL" "$src_dir"
+
+  say "Applying Proton patch stack..."
+  if ! run_in_user_shell "cd '$src_dir' && ./patches/protonprep-valve-staging.sh &> patchlog.txt"; then
+    warn "Patch step failed. Last patch log lines:"
+    run_in_user_shell "tail -160 '$src_dir/patchlog.txt' 2>/dev/null || true" >&2 || true
+    die "Could not apply Proton patch stack."
+  fi
+
+  if run_in_user_shell "cd '$src_dir' && grep -iE 'Hunk .*FAILED|FAILED|\\.rej|error:' patchlog.txt >/dev/null 2>&1"; then
+    warn "Patch log contains failure/error markers. Last matching lines:"
+    run_in_user_shell "cd '$src_dir' && grep -iE 'Hunk .*FAILED|FAILED|\\.rej|error:' patchlog.txt | tail -80" >&2 || true
+    die "Could not safely continue Proton build."
+  fi
+
+  run_as_user mkdir -p "$build_dir"
+
+  say "Building Proton redist tarball..."
+  if ! run_in_user_shell "cd '$build_dir' && { '$src_dir/configure.sh' --build-name='$RTSP_BUILD_NAME' && make redist; } &> log"; then
+    warn "Proton build failed. Last build log lines:"
+    run_in_user_shell "tail -180 '$build_dir/log' 2>/dev/null || true" >&2 || true
+    die "Could not build Proton redist tarball."
+  fi
+
+  [[ -f "$archive" ]] || die "Build finished but tarball was not found: $archive"
+
+  say "Installing built Proton into $dest"
+  run_as_user tar -xf "$archive" -C "$dest"
+
+  [[ -d "$current_dir" ]] || die "Install finished but compatibility tool directory was not found: $current_dir"
+
+  say "Installed local Proton build: $RTSP_TOOL_NAME"
+}
+
 fetch_rtsp_release() {
-  fetch_github_release "$RTSP_REPO" rtsp
+  if [[ "${RTSP_BUILD_FROM_SOURCE:-0}" == "1" ]]; then
+    set_local_rtsp_build_release_info
+  else
+    fetch_github_release "$RTSP_REPO" rtsp
+  fi
 }
 
 fetch_wayvr_release() {
@@ -757,6 +854,11 @@ verify_rtsp_archive() {
 
 install_rtsp() {
   local force="${1:-0}"
+
+  if [[ "${RTSP_BUILD_FROM_SOURCE:-0}" == "1" ]]; then
+    build_install_rtsp_from_source "$force"
+    return
+  fi
 
   fetch_rtsp_release
   detect_steam
@@ -1367,7 +1469,25 @@ update_mode() {
     local existing_rtsp=""
     existing_rtsp="$(installed_rtsp_versions || true)"
 
-    if [[ -d "$rtsp_dest" ]]; then
+    if [[ "${RTSP_BUILD_FROM_SOURCE:-0}" == "1" ]]; then
+      if [[ -d "$rtsp_dest" ]]; then
+        say "Local Proton build is already installed: $RTSP_TOOL_NAME"
+        if prompt_yes_no "Rebuild/reinstall it from $RTSP_SOURCE_REF now?" "Y"; then
+          if ensure_steam_closed_for_update; then
+            install_rtsp 1
+            configure_steam_for_vrchat
+          fi
+        fi
+      else
+        say "Local Proton build is not installed yet: $RTSP_TOOL_NAME"
+        if prompt_yes_no "Build/install it from $RTSP_SOURCE_REF now?" "Y"; then
+          if ensure_steam_closed_for_update; then
+            install_rtsp
+            configure_steam_for_vrchat
+          fi
+        fi
+      fi
+    elif [[ -d "$rtsp_dest" ]]; then
       say "Proton-GE-RTSP is already at the latest detected version: $RTSP_TAG"
     else
       if [[ -n "$existing_rtsp" ]]; then
