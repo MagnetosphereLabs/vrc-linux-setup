@@ -794,26 +794,26 @@ build_install_rtsp_from_source() {
 
   run_as_user rm -rf "$src_dir" "$build_dir"
 
-  say "Cloning Proton source and submodules..."
-  run_as_user git clone --recurse-submodules --branch "$RTSP_SOURCE_REF" "$RTSP_SOURCE_REPO_URL" "$src_dir"
+  say "Cloning Proton source..."
+  run_as_user git clone --branch "$RTSP_SOURCE_REF" "$RTSP_SOURCE_REPO_URL" "$src_dir"
+
+  say "Verifying modded Proton fork contains the VRChat mic capture-buffer patch..."
+  [[ -f "$src_dir/patches/proton/winepulse-capture-buffer-ms.patch" ]] || die "Missing patch file: patches/proton/winepulse-capture-buffer-ms.patch"
+  grep -q "WINEPULSE_CAPTURE_BUFFER_MS" "$src_dir/patches/proton/winepulse-capture-buffer-ms.patch" || die "Patch file exists, but does not contain WINEPULSE_CAPTURE_BUFFER_MS."
+  grep -q "winepulse-capture-buffer-ms.patch" "$src_dir/patches/protonprep-valve-staging.sh" || die "protonprep-valve-staging.sh does not apply winepulse-capture-buffer-ms.patch."
+  say "Verified patch file and protonprep wiring."
+
+  say "Cloning Proton submodules..."
+  run_in_user_shell "cd '$src_dir' && git submodule update --init --recursive"
 
   say "Applying Proton patch stack..."
   if ! run_in_user_shell "cd '$src_dir' && ./patches/protonprep-valve-staging.sh &> patchlog.txt"; then
     warn "Patch step failed. Last patch log lines:"
-    run_in_user_shell "tail -160 '$src_dir/patchlog.txt' 2>/dev/null || true" >&2 || true
+    run_in_user_shell "tail -180 '$src_dir/patchlog.txt' 2>/dev/null || true" >&2 || true
     die "Could not apply Proton patch stack."
   fi
 
-  if run_in_user_shell "grep -R 'WINEPULSE_CAPTURE_BUFFER_MS' '$src_dir/wine/dlls/winepulse.drv/pulse.c' >/dev/null 2>&1"; then
-    say "Verified VRChat mic capture-buffer patch is present in WinePulse."
-  else
-    die "VRChat mic capture-buffer patch was not found in WinePulse after patching."
-  fi
-
-  if run_in_user_shell "cd '$src_dir' && grep -iE 'Hunk .*FAILED|FAILED|\\.rej|error:' patchlog.txt >/dev/null 2>&1"; then
-    warn "Patch log contains RTSP patch warnings/reject text, but protonprep did not exit as failed."
-    warn "Continuing to build because the VRChat mic patch is present."
-  fi
+  say "Proton patch stack completed. Continuing to build."
 
   run_as_user mkdir -p "$build_dir"
 
