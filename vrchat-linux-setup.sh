@@ -11,7 +11,8 @@ RTSP_SOURCE_REPO_URL="${RTSP_SOURCE_REPO_URL:-https://github.com/MagnetosphereLa
 RTSP_SOURCE_REF="${RTSP_SOURCE_REF:-vrc-mic-capture-buffer}"
 RTSP_BUILD_NAME="${RTSP_BUILD_NAME:-GE-Proton10-33-rtsp24-1-vrcmic1}"
 RTSP_BUILD_DIR_REL=".local/share/vrchat-linux-setup/proton-ge-rtsp-build"
-PROTON_BUILD_MAX_THREADS="${PROTON_BUILD_MAX_THREADS:-half}"
+PROTON_BUILD_MAX_THREADS="${PROTON_BUILD_MAX_THREADS:-2}"
+RTSP_REUSE_BUILD_TREE="${RTSP_REUSE_BUILD_TREE:-1}"
 
 # Proton-GE-RTSP release channel.
 # Only used when RTSP_BUILD_FROM_SOURCE=0.
@@ -305,7 +306,7 @@ need_cmds() {
   local missing=()
   local cmd
 
-  for cmd in curl python3 tar awk sed grep findmnt getent lspci git make gcc g++; do
+  for cmd in curl python3 tar awk sed grep findmnt getent lspci git make gcc g++ patch; do
     have "$cmd" || missing+=("$cmd")
   done
 
@@ -314,7 +315,7 @@ need_cmds() {
     sudo_do apt-get update
     sudo_do apt-get install -y \
       curl python3 tar pciutils util-linux gawk sed grep coreutils findutils \
-      git make gcc g++ build-essential ca-certificates pkg-config autoconf automake \
+      git make gcc g++ patch build-essential ca-certificates pkg-config autoconf automake \
       libtool bison flex meson ninja-build cmake
   fi
 }
@@ -808,6 +809,54 @@ set_local_rtsp_build_release_info() {
   RTSP_NOTES="Local source build from $RTSP_SOURCE_REPO_URL ref $RTSP_SOURCE_REF"
 }
 
+ensure_winepulse_capture_patch_applied() {
+  local src_dir="$1"
+  local patch_path="$src_dir/patches/proton/winepulse-capture-buffer-ms.patch"
+  local pulse_path="$src_dir/wine/dlls/winepulse.drv/pulse.c"
+
+  [[ -f "$patch_path" ]] || die "Missing patch file: $patch_path"
+  [[ -f "$pulse_path" ]] || die "Missing WinePulse source file: $pulse_path"
+
+  if grep -q 'WINEPULSE_CAPTURE_BUFFER_MS' "$pulse_path"; then
+    say "Verified WinePulse capture-buffer patch is already applied."
+    return 0
+  fi
+
+  warn "protonprep completed, but WinePulse capture-buffer patch is not present in the Wine source."
+  warn "Applying winepulse-capture-buffer-ms.patch directly to wine/ now."
+
+  if ! run_in_user_shell "cd '$src_dir/wine' && patch -p1 < '$patch_path'"; then
+    die "Failed to directly apply winepulse-capture-buffer-ms.patch to Wine source."
+  fi
+
+  if grep -q 'WINEPULSE_CAPTURE_BUFFER_MS' "$pulse_path"; then
+    say "Verified WinePulse capture-buffer patch is now applied."
+  else
+    die "Patch command completed, but WINEPULSE_CAPTURE_BUFFER_MS is still missing from WinePulse source."
+  fi
+}
+
+prepare_rtsp_source_tree() {
+  local src_dir="$1"
+
+  if [[ "${RTSP_REUSE_BUILD_TREE:-1}" == "1" && -d "$src_dir/.git" ]]; then
+    say "Reusing existing Proton source tree: $src_dir"
+    say "Use RTSP_REUSE_BUILD_TREE=0 to force a clean source clone."
+
+    run_in_user_shell "cd '$src_dir' && printf 'Source branch: ' && git branch --show-current || true"
+    run_in_user_shell "cd '$src_dir' && printf 'Source HEAD: ' && git rev-parse --short HEAD || true"
+  else
+    say "Creating fresh Proton source tree..."
+    run_as_user rm -rf "$src_dir"
+    run_as_user git clone --branch "$RTSP_SOURCE_REF" "$RTSP_SOURCE_REPO_URL" "$src_dir"
+  fi
+
+  [[ -d "$src_dir/.git" ]] || die "Proton source tree is missing or invalid: $src_dir"
+
+  say "Ensuring Proton submodules are present. Existing submodules will be reused."
+  run_in_user_shell "cd '$src_dir' && git submodule update --init --recursive"
+}
+
 build_install_rtsp_from_source() {
   local force="${1:-0}"
 
@@ -843,19 +892,21 @@ build_install_rtsp_from_source() {
   say "  Name:   $RTSP_BUILD_NAME"
   say "  Build:  $build_parent"
 
-  run_as_user rm -rf "$src_dir" "$build_dir"
+  if [[ "${RTSP_REUSE_BUILD_TREE:-1}" == "1" ]]; then
+    say "Reusing existing build directory if present: $build_dir"
+    say "Use RTSP_REUSE_BUILD_TREE=0 to force a clean rebuild."
+  else
+    say "Forcing clean Proton source/build tree."
+    run_as_user rm -rf "$src_dir" "$build_dir"
+  fi
 
-  say "Cloning Proton source..."
-  run_as_user git clone --branch "$RTSP_SOURCE_REF" "$RTSP_SOURCE_REPO_URL" "$src_dir"
+  prepare_rtsp_source_tree "$src_dir"
 
   say "Verifying modded Proton fork contains the VRChat mic capture-buffer patch..."
   [[ -f "$src_dir/patches/proton/winepulse-capture-buffer-ms.patch" ]] || die "Missing patch file: patches/proton/winepulse-capture-buffer-ms.patch"
   grep -q "WINEPULSE_CAPTURE_BUFFER_MS" "$src_dir/patches/proton/winepulse-capture-buffer-ms.patch" || die "Patch file exists, but does not contain WINEPULSE_CAPTURE_BUFFER_MS."
   grep -q "winepulse-capture-buffer-ms.patch" "$src_dir/patches/protonprep-valve-staging.sh" || die "protonprep-valve-staging.sh does not apply winepulse-capture-buffer-ms.patch."
   say "Verified patch file and protonprep wiring."
-
-  say "Cloning Proton submodules..."
-  run_in_user_shell "cd '$src_dir' && git submodule update --init --recursive"
 
   say "Applying Proton patch stack..."
   if ! run_in_user_shell "cd '$src_dir' && ./patches/protonprep-valve-staging.sh &> patchlog.txt"; then
@@ -864,9 +915,12 @@ build_install_rtsp_from_source() {
     die "Could not apply Proton patch stack."
   fi
 
-  say "Proton patch stack completed. Continuing to build."
+  say "Proton patch stack completed."
+  ensure_winepulse_capture_patch_applied "$src_dir"
+  say "Continuing to build with verified WinePulse capture-buffer patch."
 
   run_as_user mkdir -p "$build_dir"
+  run_as_user rm -f "$archive"
 
   local build_jobs
   build_jobs="$(proton_build_jobs)"
@@ -875,7 +929,7 @@ build_install_rtsp_from_source() {
   say "Detected system threads: $(nproc 2>/dev/null || getconf _NPROCESSORS_ONLN 2>/dev/null || printf 'unknown')"
   say "Override with PROTON_BUILD_MAX_THREADS=N if needed."
 
-  if ! run_in_user_shell "cd '$build_dir' && { export MAKEFLAGS='-j$build_jobs -l$build_jobs'; export CMAKE_BUILD_PARALLEL_LEVEL='$build_jobs'; export NINJAFLAGS='-j$build_jobs'; '$src_dir/configure.sh' --build-name='$RTSP_BUILD_NAME' && make -j'$build_jobs' -l'$build_jobs' redist; } &> log"; then
+  if ! run_in_user_shell "cd '$build_dir' && { export MAKEFLAGS='-j$build_jobs -l$build_jobs'; export CMAKE_BUILD_PARALLEL_LEVEL='$build_jobs'; export NINJAFLAGS='-j$build_jobs'; export SAMUFLAGS='-j$build_jobs'; export MESON_NUM_PROCESSES='$build_jobs'; '$src_dir/configure.sh' --build-name='$RTSP_BUILD_NAME' && nice -n 19 ionice -c3 make -j'$build_jobs' -l'$build_jobs' redist; } &> log"; then
     warn "Proton build failed. Last build log lines:"
     run_in_user_shell "tail -180 '$build_dir/log' 2>/dev/null || true" >&2 || true
     die "Could not build Proton redist tarball."
@@ -887,6 +941,15 @@ build_install_rtsp_from_source() {
   run_as_user tar -xf "$archive" -C "$dest"
 
   [[ -d "$current_dir" ]] || die "Install finished but compatibility tool directory was not found: $current_dir"
+
+  if grep -R -a -q 'WINEPULSE_CAPTURE_BUFFER_MS' "$current_dir/files/lib/wine" 2>/dev/null; then
+    say "Verified installed Proton contains WinePulse capture-buffer patch."
+  else
+    warn "Installed Proton does not contain WINEPULSE_CAPTURE_BUFFER_MS."
+    warn "Removing broken install so Steam cannot use it."
+    run_as_user rm -rf "$current_dir"
+    die "Built Proton is missing the WinePulse capture-buffer patch."
+  fi
 
   say "Installed local Proton build: $RTSP_TOOL_NAME"
 }
