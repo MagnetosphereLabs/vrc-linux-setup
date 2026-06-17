@@ -11,7 +11,7 @@ RTSP_SOURCE_REPO_URL="${RTSP_SOURCE_REPO_URL:-https://github.com/MagnetosphereLa
 RTSP_SOURCE_REF="${RTSP_SOURCE_REF:-vrc-mic-capture-buffer}"
 RTSP_BUILD_NAME="${RTSP_BUILD_NAME:-GE-Proton10-33-rtsp24-1-vrcmic1}"
 RTSP_BUILD_DIR_REL=".local/share/vrchat-linux-setup/proton-ge-rtsp-build"
-PROTON_BUILD_MAX_THREADS="${PROTON_BUILD_MAX_THREADS:-2}"
+PROTON_BUILD_MAX_THREADS="${PROTON_BUILD_MAX_THREADS:-half}"
 RTSP_REUSE_BUILD_TREE="${RTSP_REUSE_BUILD_TREE:-1}"
 RTSP_FORCE_PROTONPREP="${RTSP_FORCE_PROTONPREP:-0}"
 WINEPULSE_CAPTURE_PATCH_VERSION="v2-direct-source-edit"
@@ -86,30 +86,45 @@ have() {
 }
 
 proton_build_jobs() {
-  local total jobs
+  local total requested jobs max_jobs
 
   total="$(nproc 2>/dev/null || getconf _NPROCESSORS_ONLN 2>/dev/null || printf '2')"
 
-  if [[ "${PROTON_BUILD_MAX_THREADS:-half}" == "half" ]]; then
-    jobs=$(( total / 2 ))
-  else
-    jobs="${PROTON_BUILD_MAX_THREADS}"
+  if ! [[ "$total" =~ ^[0-9]+$ ]]; then
+    total=2
   fi
+
+  max_jobs=$(( total / 2 ))
+
+  if (( max_jobs < 1 )); then
+    max_jobs=1
+  fi
+
+  requested="${PROTON_BUILD_MAX_THREADS:-half}"
+
+  case "$requested" in
+    half)
+      jobs="$max_jobs"
+      ;;
+    quarter)
+      jobs=$(( total / 4 ))
+      ;;
+    *)
+      jobs="$requested"
+      ;;
+  esac
 
   if ! [[ "$jobs" =~ ^[0-9]+$ ]]; then
-    jobs=1
+    jobs="$max_jobs"
   fi
 
   if (( jobs < 1 )); then
     jobs=1
   fi
 
-  if (( jobs > total / 2 && "${PROTON_BUILD_MAX_THREADS:-half}" == "half" )); then
-    jobs=$(( total / 2 ))
-  fi
-
-  if (( jobs < 1 )); then
-    jobs=1
+  if (( jobs > max_jobs )); then
+    warn "Requested PROTON_BUILD_MAX_THREADS=$requested, but capping at half the system threads: $max_jobs"
+    jobs="$max_jobs"
   fi
 
   printf '%s\n' "$jobs"
@@ -950,6 +965,24 @@ prepare_rtsp_source_tree() {
   run_in_user_shell "cd '$src_dir' && git submodule update --init --recursive"
 }
 
+protonprep_already_applied() {
+  local src_dir="$1"
+  local stamp_file="$src_dir/.vrchat-linux-setup/protonprep.done"
+  local patchlog="$src_dir/patchlog.txt"
+
+  if [[ -f "$stamp_file" ]]; then
+    return 0
+  fi
+
+  # Fast-path compatibility for source trees patched by older versions of this installer,
+  # before the protonprep.done stamp existed.
+  if [[ -f "$patchlog" ]] && grep -q 'WINE: Add winepulse fast polling env variable' "$patchlog"; then
+    return 0
+  fi
+
+  return 1
+}
+
 build_install_rtsp_from_source() {
   local force="${1:-0}"
 
@@ -1003,10 +1036,17 @@ build_install_rtsp_from_source() {
 
   local protonprep_stamp="$src_dir/.vrchat-linux-setup/protonprep.done"
 
-  if [[ "${RTSP_FORCE_PROTONPREP:-0}" == "1" || ! -f "$protonprep_stamp" ]]; then
-    say "Applying Proton patch stack..."
-    run_as_user mkdir -p "$src_dir/.vrchat-linux-setup"
+  run_as_user mkdir -p "$src_dir/.vrchat-linux-setup"
 
+  if [[ "${RTSP_FORCE_PROTONPREP:-0}" == "1" ]]; then
+    say "RTSP_FORCE_PROTONPREP=1 was set. Reapplying Proton patch stack from a clean source tree is required."
+    die "Do not force protonprep on a reused already-patched tree. Run with RTSP_REUSE_BUILD_TREE=0 if you truly need a clean protonprep."
+  elif protonprep_already_applied "$src_dir"; then
+    say "Proton patch stack already appears applied. Skipping protonprep for fast incremental rebuild."
+    say "Use RTSP_REUSE_BUILD_TREE=0 for a clean source/build refresh."
+    printf '%s\n' "$(date -Is)" | run_as_user tee "$protonprep_stamp" >/dev/null
+  else
+    say "Applying Proton patch stack..."
     if ! run_in_user_shell "cd '$src_dir' && ./patches/protonprep-valve-staging.sh &> patchlog.txt"; then
       warn "Patch step failed. Last patch log lines:"
       run_in_user_shell "tail -180 '$src_dir/patchlog.txt' 2>/dev/null || true" >&2 || true
@@ -1015,9 +1055,6 @@ build_install_rtsp_from_source() {
 
     printf '%s\n' "$(date -Is)" | run_as_user tee "$protonprep_stamp" >/dev/null
     say "Proton patch stack completed."
-  else
-    say "Proton patch stack already applied. Skipping protonprep for fast incremental rebuild."
-    say "Use RTSP_FORCE_PROTONPREP=1 to force protonprep again."
   fi
 
   ensure_winepulse_capture_patch_applied "$src_dir"
@@ -1046,10 +1083,12 @@ build_install_rtsp_from_source() {
 
   [[ -d "$current_dir" ]] || die "Install finished but compatibility tool directory was not found: $current_dir"
 
-  if grep -R -a -q 'WINEPULSE_CAPTURE_BUFFER_MS' "$current_dir/files/lib/wine" 2>/dev/null; then
+  if grep -q 'AELORIA_VRC_CAPTURE_BUFFER_MS_PATCH_V2_FUNC' "$src_dir/wine/dlls/winepulse.drv/pulse.c" \
+    && grep -q 'AELORIA_VRC_CAPTURE_BUFFER_MS_PATCH_V2_USE' "$src_dir/wine/dlls/winepulse.drv/pulse.c" \
+    && grep -R -a -q 'WINEPULSE_CAPTURE_BUFFER_MS' "$current_dir/files/lib/wine" 2>/dev/null; then
     say "Verified installed Proton contains WinePulse capture-buffer patch."
   else
-    warn "Installed Proton does not contain WINEPULSE_CAPTURE_BUFFER_MS."
+    warn "Installed Proton does not contain the verified WinePulse capture-buffer patch."
     warn "Removing broken install so Steam cannot use it."
     run_as_user rm -rf "$current_dir"
     die "Built Proton is missing the WinePulse capture-buffer patch."
