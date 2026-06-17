@@ -13,6 +13,8 @@ RTSP_BUILD_NAME="${RTSP_BUILD_NAME:-GE-Proton10-33-rtsp24-1-vrcmic1}"
 RTSP_BUILD_DIR_REL=".local/share/vrchat-linux-setup/proton-ge-rtsp-build"
 PROTON_BUILD_MAX_THREADS="${PROTON_BUILD_MAX_THREADS:-2}"
 RTSP_REUSE_BUILD_TREE="${RTSP_REUSE_BUILD_TREE:-1}"
+RTSP_FORCE_PROTONPREP="${RTSP_FORCE_PROTONPREP:-0}"
+WINEPULSE_CAPTURE_PATCH_VERSION="v2-direct-source-edit"
 
 # Proton-GE-RTSP release channel.
 # Only used when RTSP_BUILD_FROM_SOURCE=0.
@@ -811,43 +813,134 @@ set_local_rtsp_build_release_info() {
 
 ensure_winepulse_capture_patch_applied() {
   local src_dir="$1"
-  local patch_path="$src_dir/patches/proton/winepulse-capture-buffer-ms.patch"
   local pulse_path="$src_dir/wine/dlls/winepulse.drv/pulse.c"
+  local stamp_dir="$src_dir/.vrchat-linux-setup"
+  local stamp_file="$stamp_dir/winepulse-capture-patch.version"
 
-  [[ -f "$patch_path" ]] || die "Missing patch file: $patch_path"
   [[ -f "$pulse_path" ]] || die "Missing WinePulse source file: $pulse_path"
 
-  if grep -q 'WINEPULSE_CAPTURE_BUFFER_MS' "$pulse_path"; then
-    say "Verified WinePulse capture-buffer patch is already applied."
+  run_as_user mkdir -p "$stamp_dir"
+
+  if grep -q 'AELORIA_VRC_CAPTURE_BUFFER_MS_PATCH_V2_FUNC' "$pulse_path" \
+    && grep -q 'AELORIA_VRC_CAPTURE_BUFFER_MS_PATCH_V2_USE' "$pulse_path" \
+    && grep -q 'WINEPULSE_CAPTURE_BUFFER_MS' "$pulse_path" \
+    && [[ "$(cat "$stamp_file" 2>/dev/null || true)" == "$WINEPULSE_CAPTURE_PATCH_VERSION" ]]; then
+    say "Verified WinePulse capture-buffer patch is already applied at $WINEPULSE_CAPTURE_PATCH_VERSION."
     return 0
   fi
 
-  warn "protonprep completed, but WinePulse capture-buffer patch is not present in the Wine source."
-  warn "Applying winepulse-capture-buffer-ms.patch directly to wine/ now."
+  warn "Applying WinePulse capture-buffer source patch: $WINEPULSE_CAPTURE_PATCH_VERSION"
 
-  if ! run_in_user_shell "cd '$src_dir/wine' && patch -p1 < '$patch_path'"; then
-    die "Failed to directly apply winepulse-capture-buffer-ms.patch to Wine source."
-  fi
+  python3 - "$pulse_path" <<'PY'
+import pathlib
+import sys
 
-  if grep -q 'WINEPULSE_CAPTURE_BUFFER_MS' "$pulse_path"; then
+path = pathlib.Path(sys.argv[1])
+text = path.read_text(encoding="utf-8", errors="replace")
+
+func_marker = "AELORIA_VRC_CAPTURE_BUFFER_MS_PATCH_V2_FUNC"
+use_marker = "AELORIA_VRC_CAPTURE_BUFFER_MS_PATCH_V2_USE"
+
+func = r'''
+/* AELORIA_VRC_CAPTURE_BUFFER_MS_PATCH_V2_FUNC */
+static UINT32 get_capture_buffer_ms_override(void)
+{
+    static int val = -1;
+
+    if (val == -1)
+    {
+        const char *env = getenv("WINEPULSE_CAPTURE_BUFFER_MS");
+
+        if (env && atoi(env) > 0)
+            val = atoi(env);
+        else
+            val = 0;
+
+        if (val)
+            TRACE("Capture buffer override enabled: %d ms\n", val);
+    }
+
+    return val > 0 ? val : 0;
+}
+
+'''
+
+use = r'''
+    /* AELORIA_VRC_CAPTURE_BUFFER_MS_PATCH_V2_USE */
+    if (stream->dataflow == eCapture)
+    {
+        UINT32 capture_buffer_ms = get_capture_buffer_ms_override();
+
+        if (capture_buffer_ms)
+        {
+            SIZE_T min_capture_frames = ((SIZE_T)params->fmt->nSamplesPerSec * capture_buffer_ms + 999) / 1000;
+
+            if (stream->bufsize_frames < min_capture_frames)
+                stream->bufsize_frames = min_capture_frames;
+        }
+    }
+
+'''
+
+if func_marker not in text:
+    anchor = "enum phys_device_bus_type {"
+    if anchor not in text:
+        raise SystemExit("Could not find insertion anchor: enum phys_device_bus_type")
+    text = text.replace(anchor, func + anchor, 1)
+
+if use_marker not in text:
+    needle = "    stream->bufsize_frames = ceil((params->duration / 10000000.) * params->fmt->nSamplesPerSec);\n"
+    if needle not in text:
+        raise SystemExit("Could not find stream->bufsize_frames insertion anchor")
+    text = text.replace(needle, needle + use, 1)
+
+path.write_text(text, encoding="utf-8")
+PY
+
+  if grep -q 'AELORIA_VRC_CAPTURE_BUFFER_MS_PATCH_V2_FUNC' "$pulse_path" \
+    && grep -q 'AELORIA_VRC_CAPTURE_BUFFER_MS_PATCH_V2_USE' "$pulse_path" \
+    && grep -q 'WINEPULSE_CAPTURE_BUFFER_MS' "$pulse_path"; then
+    printf '%s\n' "$WINEPULSE_CAPTURE_PATCH_VERSION" | run_as_user tee "$stamp_file" >/dev/null
     say "Verified WinePulse capture-buffer patch is now applied."
   else
-    die "Patch command completed, but WINEPULSE_CAPTURE_BUFFER_MS is still missing from WinePulse source."
+    die "WinePulse capture-buffer patch did not verify after source edit."
   fi
 }
 
 prepare_rtsp_source_tree() {
   local src_dir="$1"
+  local build_dir="$2"
+  local reuse_ok="no"
 
   if [[ "${RTSP_REUSE_BUILD_TREE:-1}" == "1" && -d "$src_dir/.git" ]]; then
-    say "Reusing existing Proton source tree: $src_dir"
-    say "Use RTSP_REUSE_BUILD_TREE=0 to force a clean source clone."
+    say "Checking reusable Proton source tree: $src_dir"
 
+    if run_in_user_shell "cd '$src_dir' && git fetch origin '$RTSP_SOURCE_REF' >/dev/null 2>&1"; then
+      local local_head remote_head
+      local_head="$(run_in_user_shell "cd '$src_dir' && git rev-parse HEAD 2>/dev/null || true")"
+      remote_head="$(run_in_user_shell "cd '$src_dir' && git rev-parse FETCH_HEAD 2>/dev/null || true")"
+
+      if [[ -n "$local_head" && -n "$remote_head" && "$local_head" == "$remote_head" ]]; then
+        reuse_ok="yes"
+      else
+        warn "Proton source ref changed."
+        warn "Old HEAD: ${local_head:-unknown}"
+        warn "New HEAD: ${remote_head:-unknown}"
+      fi
+    else
+      warn "Could not fetch $RTSP_SOURCE_REF. Reusing existing tree cautiously."
+      reuse_ok="yes"
+    fi
+  fi
+
+  if [[ "$reuse_ok" == "yes" ]]; then
+    say "Reusing existing Proton source tree: $src_dir"
+    say "Reusing existing build directory: $build_dir"
     run_in_user_shell "cd '$src_dir' && printf 'Source branch: ' && git branch --show-current || true"
     run_in_user_shell "cd '$src_dir' && printf 'Source HEAD: ' && git rev-parse --short HEAD || true"
   else
-    say "Creating fresh Proton source tree..."
-    run_as_user rm -rf "$src_dir"
+    say "Creating fresh Proton source/build tree."
+    run_as_user rm -rf "$src_dir" "$build_dir"
     run_as_user git clone --branch "$RTSP_SOURCE_REF" "$RTSP_SOURCE_REPO_URL" "$src_dir"
   fi
 
@@ -900,7 +993,7 @@ build_install_rtsp_from_source() {
     run_as_user rm -rf "$src_dir" "$build_dir"
   fi
 
-  prepare_rtsp_source_tree "$src_dir"
+  prepare_rtsp_source_tree "$src_dir" "$build_dir"
 
   say "Verifying modded Proton fork contains the VRChat mic capture-buffer patch..."
   [[ -f "$src_dir/patches/proton/winepulse-capture-buffer-ms.patch" ]] || die "Missing patch file: patches/proton/winepulse-capture-buffer-ms.patch"
@@ -908,14 +1001,25 @@ build_install_rtsp_from_source() {
   grep -q "winepulse-capture-buffer-ms.patch" "$src_dir/patches/protonprep-valve-staging.sh" || die "protonprep-valve-staging.sh does not apply winepulse-capture-buffer-ms.patch."
   say "Verified patch file and protonprep wiring."
 
-  say "Applying Proton patch stack..."
-  if ! run_in_user_shell "cd '$src_dir' && ./patches/protonprep-valve-staging.sh &> patchlog.txt"; then
-    warn "Patch step failed. Last patch log lines:"
-    run_in_user_shell "tail -180 '$src_dir/patchlog.txt' 2>/dev/null || true" >&2 || true
-    die "Could not apply Proton patch stack."
+  local protonprep_stamp="$src_dir/.vrchat-linux-setup/protonprep.done"
+
+  if [[ "${RTSP_FORCE_PROTONPREP:-0}" == "1" || ! -f "$protonprep_stamp" ]]; then
+    say "Applying Proton patch stack..."
+    run_as_user mkdir -p "$src_dir/.vrchat-linux-setup"
+
+    if ! run_in_user_shell "cd '$src_dir' && ./patches/protonprep-valve-staging.sh &> patchlog.txt"; then
+      warn "Patch step failed. Last patch log lines:"
+      run_in_user_shell "tail -180 '$src_dir/patchlog.txt' 2>/dev/null || true" >&2 || true
+      die "Could not apply Proton patch stack."
+    fi
+
+    printf '%s\n' "$(date -Is)" | run_as_user tee "$protonprep_stamp" >/dev/null
+    say "Proton patch stack completed."
+  else
+    say "Proton patch stack already applied. Skipping protonprep for fast incremental rebuild."
+    say "Use RTSP_FORCE_PROTONPREP=1 to force protonprep again."
   fi
 
-  say "Proton patch stack completed."
   ensure_winepulse_capture_patch_applied "$src_dir"
   say "Continuing to build with verified WinePulse capture-buffer patch."
 
