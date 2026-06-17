@@ -829,8 +829,10 @@ set_local_rtsp_build_release_info() {
 ensure_winepulse_capture_patch_applied() {
   local src_dir="$1"
   local pulse_path="$src_dir/wine/dlls/winepulse.drv/pulse.c"
+  local patch_path="$src_dir/patches/proton/winepulse-capture-buffer-ms.patch"
 
   [[ -f "$pulse_path" ]] || die "Missing WinePulse source file: $pulse_path"
+  [[ -f "$patch_path" ]] || die "Missing WinePulse patch file: $patch_path"
 
   say "Verifying WinePulse capture-stability patch from Proton repo..."
 
@@ -840,17 +842,26 @@ ensure_winepulse_capture_patch_applied() {
     && grep -q 'WINEPULSE_CAPTURE_TIMER_MS' "$pulse_path" \
     && grep -q 'WINEPULSE_CAPTURE_NO_ADJUST_LATENCY' "$pulse_path" \
     && grep -q 'WINEPULSE_CAPTURE_HIDE_DISCONTINUITY' "$pulse_path"; then
-    say "Verified WinePulse capture-stability patch is applied."
+    say "Verified WinePulse capture-stability patch is already applied."
+    return 0
+  fi
+
+  warn "WinePulse capture-stability patch was not present after protonprep."
+  warn "Applying it directly from: $patch_path"
+
+  if ! run_in_user_shell "cd '$src_dir/wine' && patch -Np1 < '$patch_path'"; then
+    die "Direct WinePulse capture-stability patch apply failed. The patch file needs its hunks fixed against this Wine source."
+  fi
+
+  if grep -q 'WINEPULSE_CAPTURE_BUFFER_MS' "$pulse_path" \
+    && grep -q 'WINEPULSE_CAPTURE_PERIOD_MS' "$pulse_path" \
+    && grep -q 'WINEPULSE_CAPTURE_FRAGSIZE_MS' "$pulse_path" \
+    && grep -q 'WINEPULSE_CAPTURE_TIMER_MS' "$pulse_path" \
+    && grep -q 'WINEPULSE_CAPTURE_NO_ADJUST_LATENCY' "$pulse_path" \
+    && grep -q 'WINEPULSE_CAPTURE_HIDE_DISCONTINUITY' "$pulse_path"; then
+    say "Verified WinePulse capture-stability patch is now applied."
   else
-    warn "WinePulse capture-stability patch did not apply correctly."
-    warn "Expected these strings in: $pulse_path"
-    warn "  WINEPULSE_CAPTURE_BUFFER_MS"
-    warn "  WINEPULSE_CAPTURE_PERIOD_MS"
-    warn "  WINEPULSE_CAPTURE_FRAGSIZE_MS"
-    warn "  WINEPULSE_CAPTURE_TIMER_MS"
-    warn "  WINEPULSE_CAPTURE_NO_ADJUST_LATENCY"
-    warn "  WINEPULSE_CAPTURE_HIDE_DISCONTINUITY"
-    die "Stopping build so a buffer-only Proton does not get installed again."
+    die "WinePulse capture-stability patch command ran, but the expected v3 strings are still missing."
   fi
 }
 
