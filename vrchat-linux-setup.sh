@@ -829,96 +829,28 @@ set_local_rtsp_build_release_info() {
 ensure_winepulse_capture_patch_applied() {
   local src_dir="$1"
   local pulse_path="$src_dir/wine/dlls/winepulse.drv/pulse.c"
-  local stamp_dir="$src_dir/.vrchat-linux-setup"
-  local stamp_file="$stamp_dir/winepulse-capture-patch.version"
 
   [[ -f "$pulse_path" ]] || die "Missing WinePulse source file: $pulse_path"
 
-  run_as_user mkdir -p "$stamp_dir"
+  say "Verifying WinePulse capture-stability patch from Proton repo..."
 
-  if grep -q 'AELORIA_VRC_CAPTURE_BUFFER_MS_PATCH_V2_FUNC' "$pulse_path" \
-    && grep -q 'AELORIA_VRC_CAPTURE_BUFFER_MS_PATCH_V2_USE' "$pulse_path" \
-    && grep -q 'WINEPULSE_CAPTURE_BUFFER_MS' "$pulse_path" \
-    && [[ "$(cat "$stamp_file" 2>/dev/null || true)" == "$WINEPULSE_CAPTURE_PATCH_VERSION" ]]; then
-    say "Verified WinePulse capture-buffer patch is already applied at $WINEPULSE_CAPTURE_PATCH_VERSION."
-    return 0
-  fi
-
-  warn "Applying WinePulse capture-buffer source patch: $WINEPULSE_CAPTURE_PATCH_VERSION"
-
-  python3 - "$pulse_path" <<'PY'
-import pathlib
-import sys
-
-path = pathlib.Path(sys.argv[1])
-text = path.read_text(encoding="utf-8", errors="replace")
-
-func_marker = "AELORIA_VRC_CAPTURE_BUFFER_MS_PATCH_V2_FUNC"
-use_marker = "AELORIA_VRC_CAPTURE_BUFFER_MS_PATCH_V2_USE"
-
-func = r'''
-/* AELORIA_VRC_CAPTURE_BUFFER_MS_PATCH_V2_FUNC */
-static UINT32 get_capture_buffer_ms_override(void)
-{
-    static int val = -1;
-
-    if (val == -1)
-    {
-        const char *env = getenv("WINEPULSE_CAPTURE_BUFFER_MS");
-
-        if (env && atoi(env) > 0)
-            val = atoi(env);
-        else
-            val = 0;
-
-        if (val)
-            TRACE("Capture buffer override enabled: %d ms\n", val);
-    }
-
-    return val > 0 ? val : 0;
-}
-
-'''
-
-use = r'''
-    /* AELORIA_VRC_CAPTURE_BUFFER_MS_PATCH_V2_USE */
-    if (stream->dataflow == eCapture)
-    {
-        UINT32 capture_buffer_ms = get_capture_buffer_ms_override();
-
-        if (capture_buffer_ms)
-        {
-            SIZE_T min_capture_frames = ((SIZE_T)params->fmt->nSamplesPerSec * capture_buffer_ms + 999) / 1000;
-
-            if (stream->bufsize_frames < min_capture_frames)
-                stream->bufsize_frames = min_capture_frames;
-        }
-    }
-
-'''
-
-if func_marker not in text:
-    anchor = "enum phys_device_bus_type {"
-    if anchor not in text:
-        raise SystemExit("Could not find insertion anchor: enum phys_device_bus_type")
-    text = text.replace(anchor, func + anchor, 1)
-
-if use_marker not in text:
-    needle = "    stream->bufsize_frames = ceil((params->duration / 10000000.) * params->fmt->nSamplesPerSec);\n"
-    if needle not in text:
-        raise SystemExit("Could not find stream->bufsize_frames insertion anchor")
-    text = text.replace(needle, needle + use, 1)
-
-path.write_text(text, encoding="utf-8")
-PY
-
-  if grep -q 'AELORIA_VRC_CAPTURE_BUFFER_MS_PATCH_V2_FUNC' "$pulse_path" \
-    && grep -q 'AELORIA_VRC_CAPTURE_BUFFER_MS_PATCH_V2_USE' "$pulse_path" \
-    && grep -q 'WINEPULSE_CAPTURE_BUFFER_MS' "$pulse_path"; then
-    printf '%s\n' "$WINEPULSE_CAPTURE_PATCH_VERSION" | run_as_user tee "$stamp_file" >/dev/null
-    say "Verified WinePulse capture-buffer patch is now applied."
+  if grep -q 'WINEPULSE_CAPTURE_BUFFER_MS' "$pulse_path" \
+    && grep -q 'WINEPULSE_CAPTURE_PERIOD_MS' "$pulse_path" \
+    && grep -q 'WINEPULSE_CAPTURE_FRAGSIZE_MS' "$pulse_path" \
+    && grep -q 'WINEPULSE_CAPTURE_TIMER_MS' "$pulse_path" \
+    && grep -q 'WINEPULSE_CAPTURE_NO_ADJUST_LATENCY' "$pulse_path" \
+    && grep -q 'WINEPULSE_CAPTURE_HIDE_DISCONTINUITY' "$pulse_path"; then
+    say "Verified WinePulse capture-stability patch is applied."
   else
-    die "WinePulse capture-buffer patch did not verify after source edit."
+    warn "WinePulse capture-stability patch did not apply correctly."
+    warn "Expected these strings in: $pulse_path"
+    warn "  WINEPULSE_CAPTURE_BUFFER_MS"
+    warn "  WINEPULSE_CAPTURE_PERIOD_MS"
+    warn "  WINEPULSE_CAPTURE_FRAGSIZE_MS"
+    warn "  WINEPULSE_CAPTURE_TIMER_MS"
+    warn "  WINEPULSE_CAPTURE_NO_ADJUST_LATENCY"
+    warn "  WINEPULSE_CAPTURE_HIDE_DISCONTINUITY"
+    die "Stopping build so a buffer-only Proton does not get installed again."
   fi
 }
 
