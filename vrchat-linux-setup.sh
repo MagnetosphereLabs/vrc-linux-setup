@@ -288,6 +288,25 @@ need_cmds() {
   fi
 }
 
+ensure_proton_container_engine() {
+  [[ "${RTSP_BUILD_FROM_SOURCE:-0}" == "1" ]] || return 0
+
+  if have podman; then
+    say "Podman detected for Proton source builds."
+    return 0
+  fi
+
+  say "Proton source builds require a container engine."
+  say "Installing Podman only, not Docker. Podman is daemonless and is used only for Proton builds/updates."
+
+  sudo_do apt-get update
+  sudo_do apt-get install -y podman uidmap slirp4netns fuse-overlayfs
+
+  have podman || die "Podman install finished, but podman command was still not found."
+
+  say "Podman installed."
+}
+
 ensure_flatpak_stack() {
   local pkgs=()
   have flatpak || pkgs+=(flatpak)
@@ -774,6 +793,7 @@ build_install_rtsp_from_source() {
 
   run_as_user mkdir -p "$dest" "$build_parent"
   check_steam_not_running
+  ensure_proton_container_engine
 
   if [[ -d "$current_dir" ]]; then
     if [[ "$force" == "1" ]]; then
