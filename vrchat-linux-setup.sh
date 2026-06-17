@@ -1042,6 +1042,17 @@ verify_archive_contains_winepulse_patch() {
   return 1
 }
 
+clean_rtsp_redist_outputs() {
+  local build_dir="$1"
+  local archive="$2"
+
+  say "Cleaning stale Proton redist packaging outputs."
+  run_as_user rm -rf \
+    "$build_dir/redist" \
+    "$build_dir/$RTSP_BUILD_NAME" \
+    "$archive"
+}
+
 run_proton_redist_build() {
   local src_dir="$1"
   local build_dir="$2"
@@ -1126,10 +1137,10 @@ build_install_rtsp_from_source() {
 
   ensure_winepulse_capture_patch_applied "$src_dir"
   say "Continuing to build with verified WinePulse capture-buffer patch."
-
+  
   run_as_user mkdir -p "$build_dir"
   force_winepulse_rebuild_cache "$src_dir" "$build_dir"
-  run_as_user rm -f "$archive"
+  clean_rtsp_redist_outputs "$build_dir" "$archive"
 
   local build_jobs
   build_jobs="$(proton_build_jobs)"
@@ -1153,7 +1164,7 @@ build_install_rtsp_from_source() {
     run_as_user rm -rf "$build_dir"
     run_as_user mkdir -p "$build_dir"
     force_winepulse_rebuild_cache "$src_dir" "$build_dir"
-    run_as_user rm -f "$archive"
+    clean_rtsp_redist_outputs "$build_dir" "$archive"
 
     if ! run_proton_redist_build "$src_dir" "$build_dir" "$build_jobs"; then
       warn "Clean build-dir rebuild failed. Last build log lines:"
