@@ -11,6 +11,7 @@ RTSP_SOURCE_REPO_URL="${RTSP_SOURCE_REPO_URL:-https://github.com/MagnetosphereLa
 RTSP_SOURCE_REF="${RTSP_SOURCE_REF:-vrc-mic-capture-buffer}"
 RTSP_BUILD_NAME="${RTSP_BUILD_NAME:-GE-Proton10-33-rtsp24-1-vrcmic1}"
 RTSP_BUILD_DIR_REL=".local/share/vrchat-linux-setup/proton-ge-rtsp-build"
+PROTON_BUILD_MAX_THREADS="${PROTON_BUILD_MAX_THREADS:-half}"
 
 # Proton-GE-RTSP release channel.
 # Only used when RTSP_BUILD_FROM_SOURCE=0.
@@ -79,6 +80,36 @@ die() {
 
 have() {
   command -v "$1" >/dev/null 2>&1
+}
+
+proton_build_jobs() {
+  local total jobs
+
+  total="$(nproc 2>/dev/null || getconf _NPROCESSORS_ONLN 2>/dev/null || printf '2')"
+
+  if [[ "${PROTON_BUILD_MAX_THREADS:-half}" == "half" ]]; then
+    jobs=$(( total / 2 ))
+  else
+    jobs="${PROTON_BUILD_MAX_THREADS}"
+  fi
+
+  if ! [[ "$jobs" =~ ^[0-9]+$ ]]; then
+    jobs=1
+  fi
+
+  if (( jobs < 1 )); then
+    jobs=1
+  fi
+
+  if (( jobs > total / 2 && "${PROTON_BUILD_MAX_THREADS:-half}" == "half" )); then
+    jobs=$(( total / 2 ))
+  fi
+
+  if (( jobs < 1 )); then
+    jobs=1
+  fi
+
+  printf '%s\n' "$jobs"
 }
 
 run_as_user() {
@@ -837,8 +868,14 @@ build_install_rtsp_from_source() {
 
   run_as_user mkdir -p "$build_dir"
 
-  say "Building Proton redist tarball..."
-  if ! run_in_user_shell "cd '$build_dir' && { '$src_dir/configure.sh' --build-name='$RTSP_BUILD_NAME' && make redist; } &> log"; then
+  local build_jobs
+  build_jobs="$(proton_build_jobs)"
+
+  say "Building Proton redist tarball with CPU limit: $build_jobs job(s)."
+  say "Detected system threads: $(nproc 2>/dev/null || getconf _NPROCESSORS_ONLN 2>/dev/null || printf 'unknown')"
+  say "Override with PROTON_BUILD_MAX_THREADS=N if needed."
+
+  if ! run_in_user_shell "cd '$build_dir' && { export MAKEFLAGS='-j$build_jobs -l$build_jobs'; export CMAKE_BUILD_PARALLEL_LEVEL='$build_jobs'; export NINJAFLAGS='-j$build_jobs'; '$src_dir/configure.sh' --build-name='$RTSP_BUILD_NAME' && make -j'$build_jobs' -l'$build_jobs' redist; } &> log"; then
     warn "Proton build failed. Last build log lines:"
     run_in_user_shell "tail -180 '$build_dir/log' 2>/dev/null || true" >&2 || true
     die "Could not build Proton redist tarball."
