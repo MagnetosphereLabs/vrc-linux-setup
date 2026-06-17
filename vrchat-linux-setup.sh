@@ -983,6 +983,73 @@ protonprep_already_applied() {
   return 1
 }
 
+force_winepulse_rebuild_cache() {
+  local src_dir="$1"
+  local build_dir="$2"
+  local pulse_path="$src_dir/wine/dlls/winepulse.drv/pulse.c"
+
+  [[ -f "$pulse_path" ]] || die "Missing WinePulse source file: $pulse_path"
+
+  say "Forcing WinePulse to rebuild from patched source."
+  run_as_user touch "$pulse_path"
+
+  [[ -d "$build_dir" ]] || return 0
+
+  # Remove only cached WinePulse artifacts, not the whole Proton build cache.
+  run_in_user_shell "
+    find '$build_dir' -type f \
+      \\( -name 'winepulse.so' \
+      -o -name 'winepulse.drv' \
+      -o -name 'pulse.o' \
+      -o -name 'pulse.obj' \
+      -o -name 'pulse.lo' \
+      -o -name 'pulse.d' \
+      -o -name 'pulse.dep' \\) \
+      -print -delete 2>/dev/null || true
+  "
+
+  # Remove WinePulse-specific build directories if the build tree has them.
+  run_in_user_shell "
+    find '$build_dir' -type d \
+      \\( -path '*/dlls/winepulse.drv' -o -path '*/winepulse.drv' \\) \
+      -print -exec rm -rf {} + 2>/dev/null || true
+  "
+}
+
+verify_archive_contains_winepulse_patch() {
+  local archive="$1"
+  local tmpdir=""
+
+  [[ -f "$archive" ]] || die "Archive does not exist: $archive"
+
+  tmpdir="$(run_as_user mktemp -d)"
+
+  if ! run_as_user tar -xf "$archive" -C "$tmpdir"; then
+    run_as_user rm -rf "$tmpdir"
+    die "Could not inspect built Proton archive: $archive"
+  fi
+
+  if grep -R -a -q 'WINEPULSE_CAPTURE_BUFFER_MS' "$tmpdir" 2>/dev/null; then
+    say "Verified built Proton archive contains WinePulse capture-buffer patch."
+    run_as_user rm -rf "$tmpdir"
+    return 0
+  fi
+
+  warn "Built Proton archive does not contain WINEPULSE_CAPTURE_BUFFER_MS."
+  warn "WinePulse files found inside archive:"
+  find "$tmpdir" -type f \( -iname '*winepulse*' -o -iname 'winepulse.drv*' \) -print 2>/dev/null | sed 's/^/  /' >&2 || true
+  run_as_user rm -rf "$tmpdir"
+  return 1
+}
+
+run_proton_redist_build() {
+  local src_dir="$1"
+  local build_dir="$2"
+  local build_jobs="$3"
+
+  run_in_user_shell "cd '$build_dir' && { export MAKEFLAGS='-j$build_jobs -l$build_jobs'; export CMAKE_BUILD_PARALLEL_LEVEL='$build_jobs'; export NINJAFLAGS='-j$build_jobs'; export SAMUFLAGS='-j$build_jobs'; export MESON_NUM_PROCESSES='$build_jobs'; '$src_dir/configure.sh' --build-name='$RTSP_BUILD_NAME' && nice -n 19 ionice -c3 make -j'$build_jobs' -l'$build_jobs' redist; } &> log"
+}
+
 build_install_rtsp_from_source() {
   local force="${1:-0}"
 
@@ -1061,6 +1128,7 @@ build_install_rtsp_from_source() {
   say "Continuing to build with verified WinePulse capture-buffer patch."
 
   run_as_user mkdir -p "$build_dir"
+  force_winepulse_rebuild_cache "$src_dir" "$build_dir"
   run_as_user rm -f "$archive"
 
   local build_jobs
@@ -1070,13 +1138,32 @@ build_install_rtsp_from_source() {
   say "Detected system threads: $(nproc 2>/dev/null || getconf _NPROCESSORS_ONLN 2>/dev/null || printf 'unknown')"
   say "Override with PROTON_BUILD_MAX_THREADS=N if needed."
 
-  if ! run_in_user_shell "cd '$build_dir' && { export MAKEFLAGS='-j$build_jobs -l$build_jobs'; export CMAKE_BUILD_PARALLEL_LEVEL='$build_jobs'; export NINJAFLAGS='-j$build_jobs'; export SAMUFLAGS='-j$build_jobs'; export MESON_NUM_PROCESSES='$build_jobs'; '$src_dir/configure.sh' --build-name='$RTSP_BUILD_NAME' && nice -n 19 ionice -c3 make -j'$build_jobs' -l'$build_jobs' redist; } &> log"; then
+  if ! run_proton_redist_build "$src_dir" "$build_dir" "$build_jobs"; then
     warn "Proton build failed. Last build log lines:"
     run_in_user_shell "tail -180 '$build_dir/log' 2>/dev/null || true" >&2 || true
     die "Could not build Proton redist tarball."
   fi
 
   [[ -f "$archive" ]] || die "Build finished but tarball was not found: $archive"
+
+  if ! verify_archive_contains_winepulse_patch "$archive"; then
+    warn "Incremental build reused stale WinePulse outputs."
+    warn "Cleaning build directory only, keeping source/submodules, then rebuilding once."
+
+    run_as_user rm -rf "$build_dir"
+    run_as_user mkdir -p "$build_dir"
+    force_winepulse_rebuild_cache "$src_dir" "$build_dir"
+    run_as_user rm -f "$archive"
+
+    if ! run_proton_redist_build "$src_dir" "$build_dir" "$build_jobs"; then
+      warn "Clean build-dir rebuild failed. Last build log lines:"
+      run_in_user_shell "tail -180 '$build_dir/log' 2>/dev/null || true" >&2 || true
+      die "Could not build Proton redist tarball after cleaning build directory."
+    fi
+
+    [[ -f "$archive" ]] || die "Clean build-dir rebuild finished but tarball was not found: $archive"
+    verify_archive_contains_winepulse_patch "$archive" || die "Built archive is still missing the WinePulse capture-buffer patch after clean build-dir rebuild."
+  fi
 
   say "Installing built Proton into $dest"
   run_as_user tar -xf "$archive" -C "$dest"
