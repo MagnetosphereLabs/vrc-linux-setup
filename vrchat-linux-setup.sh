@@ -3,28 +3,10 @@ set -Eeuo pipefail
 
 SCRIPT_NAME="$(basename "$0")"
 SCRIPT_VERSION="0.1.0"
-RTSP_REPO="MagnetosphereLabs/proton-ge-rtsp"
-
-# Build our forked Proton-GE-RTSP locally instead of downloading a release tarball.
-RTSP_BUILD_FROM_SOURCE="${RTSP_BUILD_FROM_SOURCE:-1}"
-RTSP_SOURCE_REPO_URL="${RTSP_SOURCE_REPO_URL:-https://github.com/MagnetosphereLabs/proton-ge-rtsp.git}"
-RTSP_SOURCE_REF="${RTSP_SOURCE_REF:-vrc-mic-capture-buffer}"
-RTSP_BUILD_NAME="${RTSP_BUILD_NAME:-GE-Proton10-33-rtsp24-1-vrcmic1}"
-RTSP_BUILD_DIR_REL=".local/share/vrchat-linux-setup/proton-ge-rtsp-build"
-PROTON_BUILD_MAX_THREADS="${PROTON_BUILD_MAX_THREADS:-half}"
-RTSP_REUSE_BUILD_TREE="${RTSP_REUSE_BUILD_TREE:-1}"
-RTSP_FORCE_PROTONPREP="${RTSP_FORCE_PROTONPREP:-0}"
-WINEPULSE_CAPTURE_PATCH_VERSION="v2-direct-source-edit"
-
-# Proton-GE-RTSP release channel.
-# Only used when RTSP_BUILD_FROM_SOURCE=0.
-# prerelease = newest GitHub pre-release
-# latest     = normal GitHub latest release
-RTSP_RELEASE_CHANNEL="${RTSP_RELEASE_CHANNEL:-prerelease}"
-
+RTSP_REPO="SpookySkeletons/proton-ge-rtsp"
 WAYVR_REPO="wayvr-org/wayvr"
 VRCHAT_APPID="438100"
-DEFAULT_NATIVE_VR_LAUNCH='WINEPULSE_FAST_POLLING=1 WINEPULSE_CAPTURE_BUFFER_MS=2000 WINEDEBUG=-all PRESSURE_VESSEL_IMPORT_OPENXR_1_RUNTIMES=1 PRESSURE_VESSEL_FILESYSTEMS_RW=/var/lib/flatpak/app/io.github.wivrn.wivrn %command%'
+DEFAULT_NATIVE_VR_LAUNCH='PRESSURE_VESSEL_IMPORT_OPENXR_1_RUNTIMES=1 PRESSURE_VESSEL_FILESYSTEMS_RW=/var/lib/flatpak/app/io.github.wivrn.wivrn %command%'
 STATE_DIR_REL=".local/share/vrchat-linux-setup"
 WAYVR_BIN_REL=".local/bin/WayVR.AppImage"
 WAYVR_DESKTOP_REL=".local/share/applications/wayvr.desktop"
@@ -83,51 +65,6 @@ die() {
 
 have() {
   command -v "$1" >/dev/null 2>&1
-}
-
-proton_build_jobs() {
-  local total requested jobs max_jobs
-
-  total="$(nproc 2>/dev/null || getconf _NPROCESSORS_ONLN 2>/dev/null || printf '2')"
-
-  if ! [[ "$total" =~ ^[0-9]+$ ]]; then
-    total=2
-  fi
-
-  max_jobs=$(( total / 2 ))
-
-  if (( max_jobs < 1 )); then
-    max_jobs=1
-  fi
-
-  requested="${PROTON_BUILD_MAX_THREADS:-half}"
-
-  case "$requested" in
-    half)
-      jobs="$max_jobs"
-      ;;
-    quarter)
-      jobs=$(( total / 4 ))
-      ;;
-    *)
-      jobs="$requested"
-      ;;
-  esac
-
-  if ! [[ "$jobs" =~ ^[0-9]+$ ]]; then
-    jobs="$max_jobs"
-  fi
-
-  if (( jobs < 1 )); then
-    jobs=1
-  fi
-
-  if (( jobs > max_jobs )); then
-    warn "Requested PROTON_BUILD_MAX_THREADS=$requested, but capping at half the system threads: $max_jobs"
-    jobs="$max_jobs"
-  fi
-
-  printf '%s\n' "$jobs"
 }
 
 run_as_user() {
@@ -322,38 +259,15 @@ resolve_real_user() {
 need_cmds() {
   local missing=()
   local cmd
-
-  for cmd in curl python3 tar awk sed grep findmnt getent lspci git make gcc g++ patch; do
+  for cmd in curl python3 tar awk sed grep findmnt getent lspci; do
     have "$cmd" || missing+=("$cmd")
   done
 
   if ((${#missing[@]})); then
-    say "Installing required base/build packages: ${missing[*]}"
+    say "Installing required base packages: ${missing[*]}"
     sudo_do apt-get update
-    sudo_do apt-get install -y \
-      curl python3 tar pciutils util-linux gawk sed grep coreutils findutils \
-      git make gcc g++ patch build-essential ca-certificates pkg-config autoconf automake \
-      libtool bison flex meson ninja-build cmake
+    sudo_do apt-get install -y curl python3 tar pciutils util-linux gawk sed grep coreutils findutils
   fi
-}
-
-ensure_proton_container_engine() {
-  [[ "${RTSP_BUILD_FROM_SOURCE:-0}" == "1" ]] || return 0
-
-  if have podman; then
-    say "Podman detected for Proton source builds."
-    return 0
-  fi
-
-  say "Proton source builds require a container engine."
-  say "Installing Podman only, not Docker. Podman is daemonless and is used only for Proton builds/updates."
-
-  sudo_do apt-get update
-  sudo_do apt-get install -y podman uidmap slirp4netns fuse-overlayfs
-
-  have podman || die "Podman install finished, but podman command was still not found."
-
-  say "Podman installed."
 }
 
 ensure_flatpak_stack() {
@@ -705,46 +619,17 @@ check_gpu() {
 fetch_github_release() {
   local repo="$1"
   local kind="$2"
-  local tmp api_url
+  local tmp
   tmp="$(mktemp)"
-
-  if [[ "$kind" == "rtsp" && "${RTSP_RELEASE_CHANNEL:-prerelease}" == "prerelease" ]]; then
-    api_url="https://api.github.com/repos/${repo}/releases?per_page=30"
-  else
-    api_url="https://api.github.com/repos/${repo}/releases/latest"
-  fi
-
-  curl -fsSL "$api_url" -o "$tmp"
+  curl -fsSL "https://api.github.com/repos/${repo}/releases/latest" -o "$tmp"
 
   if [[ "$kind" == "rtsp" ]]; then
-    mapfile -t _fields < <(python3 - "$tmp" "${RTSP_RELEASE_CHANNEL:-prerelease}" <<'PY'
+    mapfile -t _fields < <(python3 - "$tmp" <<'PY'
 import json
 import sys
 
 with open(sys.argv[1], encoding='utf-8') as f:
-    raw = json.load(f)
-
-channel = sys.argv[2]
-data = None
-
-if isinstance(raw, list):
-    candidates = [
-        r for r in raw
-        if not r.get('draft')
-        and r.get('prerelease')
-        and any((a.get('name') or '').endswith('.tar.gz') for a in r.get('assets', []))
-    ]
-
-    if not candidates:
-        raise SystemExit('Could not determine latest Proton-GE-RTSP pre-release with a .tar.gz asset.')
-
-    candidates.sort(
-        key=lambda r: r.get('published_at') or r.get('created_at') or '',
-        reverse=True,
-    )
-    data = candidates[0]
-else:
-    data = raw
+    data = json.load(f)
 
 body = (data.get('body') or '').strip()
 tag = data.get('tag_name') or ''
@@ -816,334 +701,8 @@ PY
   rm -f "$tmp"
 }
 
-set_local_rtsp_build_release_info() {
-  RTSP_TAG="$RTSP_SOURCE_REF"
-  RTSP_ASSET_NAME="$RTSP_BUILD_NAME.tar.gz"
-  RTSP_TOOL_NAME="$RTSP_BUILD_NAME"
-  RTSP_URL="$RTSP_SOURCE_REPO_URL"
-  RTSP_SHA_URL=""
-  RTSP_RELEASE_URL="${RTSP_SOURCE_REPO_URL%.git}/tree/$RTSP_SOURCE_REF"
-  RTSP_NOTES="Local source build from $RTSP_SOURCE_REPO_URL ref $RTSP_SOURCE_REF"
-}
-
-ensure_winepulse_capture_patch_applied() {
-  local src_dir="$1"
-  local pulse_path="$src_dir/wine/dlls/winepulse.drv/pulse.c"
-  local patch_path="$src_dir/patches/proton/winepulse-capture-buffer-ms.patch"
-
-  [[ -f "$pulse_path" ]] || die "Missing WinePulse source file: $pulse_path"
-  [[ -f "$patch_path" ]] || die "Missing WinePulse patch file: $patch_path"
-
-  say "Verifying WinePulse capture-stability patch from Proton repo..."
-
-  if grep -q 'WINEPULSE_CAPTURE_BUFFER_MS' "$pulse_path" \
-    && grep -q 'WINEPULSE_CAPTURE_PERIOD_MS' "$pulse_path" \
-    && grep -q 'WINEPULSE_CAPTURE_FRAGSIZE_MS' "$pulse_path" \
-    && grep -q 'WINEPULSE_CAPTURE_TIMER_MS' "$pulse_path" \
-    && grep -q 'WINEPULSE_CAPTURE_NO_ADJUST_LATENCY' "$pulse_path" \
-    && grep -q 'WINEPULSE_CAPTURE_HIDE_DISCONTINUITY' "$pulse_path"; then
-    say "Verified WinePulse capture-stability patch is already applied."
-    return 0
-  fi
-
-  warn "WinePulse capture-stability patch was not present after protonprep."
-  warn "Applying it directly from: $patch_path"
-
-  if ! run_in_user_shell "cd '$src_dir/wine' && patch -Np1 < '$patch_path'"; then
-    die "Direct WinePulse capture-stability patch apply failed. The patch file needs its hunks fixed against this Wine source."
-  fi
-
-  if grep -q 'WINEPULSE_CAPTURE_BUFFER_MS' "$pulse_path" \
-    && grep -q 'WINEPULSE_CAPTURE_PERIOD_MS' "$pulse_path" \
-    && grep -q 'WINEPULSE_CAPTURE_FRAGSIZE_MS' "$pulse_path" \
-    && grep -q 'WINEPULSE_CAPTURE_TIMER_MS' "$pulse_path" \
-    && grep -q 'WINEPULSE_CAPTURE_NO_ADJUST_LATENCY' "$pulse_path" \
-    && grep -q 'WINEPULSE_CAPTURE_HIDE_DISCONTINUITY' "$pulse_path"; then
-    say "Verified WinePulse capture-stability patch is now applied."
-  else
-    die "WinePulse capture-stability patch command ran, but the expected v3 strings are still missing."
-  fi
-}
-
-prepare_rtsp_source_tree() {
-  local src_dir="$1"
-  local build_dir="$2"
-  local reuse_ok="no"
-
-  if [[ "${RTSP_REUSE_BUILD_TREE:-1}" == "1" && -d "$src_dir/.git" ]]; then
-    say "Checking reusable Proton source tree: $src_dir"
-
-    if run_in_user_shell "cd '$src_dir' && git fetch origin '$RTSP_SOURCE_REF' >/dev/null 2>&1"; then
-      local local_head remote_head
-      local_head="$(run_in_user_shell "cd '$src_dir' && git rev-parse HEAD 2>/dev/null || true")"
-      remote_head="$(run_in_user_shell "cd '$src_dir' && git rev-parse FETCH_HEAD 2>/dev/null || true")"
-
-      if [[ -n "$local_head" && -n "$remote_head" && "$local_head" == "$remote_head" ]]; then
-        reuse_ok="yes"
-      else
-        warn "Proton source ref changed."
-        warn "Old HEAD: ${local_head:-unknown}"
-        warn "New HEAD: ${remote_head:-unknown}"
-      fi
-    else
-      warn "Could not fetch $RTSP_SOURCE_REF. Reusing existing tree cautiously."
-      reuse_ok="yes"
-    fi
-  fi
-
-  if [[ "$reuse_ok" == "yes" ]]; then
-    say "Reusing existing Proton source tree: $src_dir"
-    say "Reusing existing build directory: $build_dir"
-    run_in_user_shell "cd '$src_dir' && printf 'Source branch: ' && git branch --show-current || true"
-    run_in_user_shell "cd '$src_dir' && printf 'Source HEAD: ' && git rev-parse --short HEAD || true"
-  else
-    say "Creating fresh Proton source/build tree."
-    run_as_user rm -rf "$src_dir" "$build_dir"
-    run_as_user git clone --branch "$RTSP_SOURCE_REF" "$RTSP_SOURCE_REPO_URL" "$src_dir"
-  fi
-
-  [[ -d "$src_dir/.git" ]] || die "Proton source tree is missing or invalid: $src_dir"
-
-  say "Ensuring Proton submodules are present. Existing submodules will be reused."
-  run_in_user_shell "cd '$src_dir' && git submodule update --init --recursive"
-}
-
-protonprep_already_applied() {
-  local src_dir="$1"
-  local stamp_file="$src_dir/.vrchat-linux-setup/protonprep.done"
-  local patchlog="$src_dir/patchlog.txt"
-
-  if [[ -f "$stamp_file" ]]; then
-    return 0
-  fi
-
-  # Fast-path compatibility for source trees patched by older versions of this installer,
-  # before the protonprep.done stamp existed.
-  if [[ -f "$patchlog" ]] && grep -q 'WINE: Add winepulse fast polling env variable' "$patchlog"; then
-    return 0
-  fi
-
-  return 1
-}
-
-force_winepulse_rebuild_cache() {
-  local src_dir="$1"
-  local build_dir="$2"
-  local pulse_path="$src_dir/wine/dlls/winepulse.drv/pulse.c"
-
-  [[ -f "$pulse_path" ]] || die "Missing WinePulse source file: $pulse_path"
-
-  say "Forcing WinePulse to rebuild from patched source."
-  run_as_user touch "$pulse_path"
-
-  [[ -d "$build_dir" ]] || return 0
-
-  # Remove only cached WinePulse artifacts, not the whole Proton build cache.
-  run_in_user_shell "
-    find '$build_dir' -type f \
-      \\( -name 'winepulse.so' \
-      -o -name 'winepulse.drv' \
-      -o -name 'pulse.o' \
-      -o -name 'pulse.obj' \
-      -o -name 'pulse.lo' \
-      -o -name 'pulse.d' \
-      -o -name 'pulse.dep' \\) \
-      -print -delete 2>/dev/null || true
-  "
-
-  # Remove WinePulse-specific build directories if the build tree has them.
-  run_in_user_shell "
-    find '$build_dir' -type d \
-      \\( -path '*/dlls/winepulse.drv' -o -path '*/winepulse.drv' \\) \
-      -print -exec rm -rf {} + 2>/dev/null || true
-  "
-}
-
-verify_archive_contains_winepulse_patch() {
-  local archive="$1"
-  local tmpdir=""
-
-  [[ -f "$archive" ]] || die "Archive does not exist: $archive"
-
-  tmpdir="$(run_as_user mktemp -d)"
-
-  if ! run_as_user tar -xf "$archive" -C "$tmpdir"; then
-    run_as_user rm -rf "$tmpdir"
-    die "Could not inspect built Proton archive: $archive"
-  fi
-
-  if grep -R -a -q 'WINEPULSE_CAPTURE_BUFFER_MS' "$tmpdir" 2>/dev/null; then
-    say "Verified built Proton archive contains WinePulse capture-buffer patch."
-    run_as_user rm -rf "$tmpdir"
-    return 0
-  fi
-
-  warn "Built Proton archive does not contain WINEPULSE_CAPTURE_BUFFER_MS."
-  warn "WinePulse files found inside archive:"
-  find "$tmpdir" -type f \( -iname '*winepulse*' -o -iname 'winepulse.drv*' \) -print 2>/dev/null | sed 's/^/  /' >&2 || true
-  run_as_user rm -rf "$tmpdir"
-  return 1
-}
-
-clean_rtsp_redist_outputs() {
-  local build_dir="$1"
-  local archive="$2"
-
-  say "Cleaning stale Proton redist packaging outputs."
-  run_as_user rm -rf \
-    "$build_dir/redist" \
-    "$build_dir/$RTSP_BUILD_NAME" \
-    "$archive"
-}
-
-run_proton_redist_build() {
-  local src_dir="$1"
-  local build_dir="$2"
-  local build_jobs="$3"
-
-  run_in_user_shell "cd '$build_dir' && { export MAKEFLAGS='-j$build_jobs -l$build_jobs'; export CMAKE_BUILD_PARALLEL_LEVEL='$build_jobs'; export NINJAFLAGS='-j$build_jobs'; export SAMUFLAGS='-j$build_jobs'; export MESON_NUM_PROCESSES='$build_jobs'; '$src_dir/configure.sh' --build-name='$RTSP_BUILD_NAME' && nice -n 19 ionice -c3 make -j'$build_jobs' -l'$build_jobs' redist; } &> log"
-}
-
-build_install_rtsp_from_source() {
-  local force="${1:-0}"
-
-  set_local_rtsp_build_release_info
-  detect_steam
-  [[ -n "$STEAM_ROOT" ]] || die "Steam must be installed before Proton-GE-RTSP can be installed."
-
-  local dest="$STEAM_ROOT/compatibilitytools.d"
-  local current_dir="$dest/$RTSP_TOOL_NAME"
-  local build_parent="$REAL_HOME/$RTSP_BUILD_DIR_REL"
-  local src_dir="$build_parent/source"
-  local build_dir="$build_parent/build"
-  local archive="$build_dir/$RTSP_BUILD_NAME.tar.gz"
-
-  run_as_user mkdir -p "$dest" "$build_parent"
-  check_steam_not_running
-  ensure_proton_container_engine
-
-  if [[ -d "$current_dir" ]]; then
-    if [[ "$force" == "1" ]]; then
-      say "Rebuilding/reinstalling local Proton-GE-RTSP: $RTSP_TOOL_NAME"
-      run_as_user rm -rf "$current_dir"
-    else
-      say "$RTSP_TOOL_NAME is already installed."
-      say "Run repair-install and choose reinstall if you want to rebuild it."
-      return 0
-    fi
-  fi
-
-  say "Preparing local Proton-GE-RTSP source build..."
-  say "  Repo:   $RTSP_SOURCE_REPO_URL"
-  say "  Ref:    $RTSP_SOURCE_REF"
-  say "  Name:   $RTSP_BUILD_NAME"
-  say "  Build:  $build_parent"
-
-  if [[ "${RTSP_REUSE_BUILD_TREE:-1}" == "1" ]]; then
-    say "Reusing existing build directory if present: $build_dir"
-    say "Use RTSP_REUSE_BUILD_TREE=0 to force a clean rebuild."
-  else
-    say "Forcing clean Proton source/build tree."
-    run_as_user rm -rf "$src_dir" "$build_dir"
-  fi
-
-  prepare_rtsp_source_tree "$src_dir" "$build_dir"
-
-  say "Verifying modded Proton fork contains the VRChat mic capture-buffer patch..."
-  [[ -f "$src_dir/patches/proton/winepulse-capture-buffer-ms.patch" ]] || die "Missing patch file: patches/proton/winepulse-capture-buffer-ms.patch"
-  grep -q "WINEPULSE_CAPTURE_BUFFER_MS" "$src_dir/patches/proton/winepulse-capture-buffer-ms.patch" || die "Patch file exists, but does not contain WINEPULSE_CAPTURE_BUFFER_MS."
-  grep -q "winepulse-capture-buffer-ms.patch" "$src_dir/patches/protonprep-valve-staging.sh" || die "protonprep-valve-staging.sh does not apply winepulse-capture-buffer-ms.patch."
-  say "Verified patch file and protonprep wiring."
-
-  local protonprep_stamp="$src_dir/.vrchat-linux-setup/protonprep.done"
-
-  run_as_user mkdir -p "$src_dir/.vrchat-linux-setup"
-
-  if [[ "${RTSP_FORCE_PROTONPREP:-0}" == "1" ]]; then
-    say "RTSP_FORCE_PROTONPREP=1 was set. Reapplying Proton patch stack from a clean source tree is required."
-    die "Do not force protonprep on a reused already-patched tree. Run with RTSP_REUSE_BUILD_TREE=0 if you truly need a clean protonprep."
-  elif protonprep_already_applied "$src_dir"; then
-    say "Proton patch stack already appears applied. Skipping protonprep for fast incremental rebuild."
-    say "Use RTSP_REUSE_BUILD_TREE=0 for a clean source/build refresh."
-    printf '%s\n' "$(date -Is)" | run_as_user tee "$protonprep_stamp" >/dev/null
-  else
-    say "Applying Proton patch stack..."
-    if ! run_in_user_shell "cd '$src_dir' && ./patches/protonprep-valve-staging.sh &> patchlog.txt"; then
-      warn "Patch step failed. Last patch log lines:"
-      run_in_user_shell "tail -180 '$src_dir/patchlog.txt' 2>/dev/null || true" >&2 || true
-      die "Could not apply Proton patch stack."
-    fi
-
-    printf '%s\n' "$(date -Is)" | run_as_user tee "$protonprep_stamp" >/dev/null
-    say "Proton patch stack completed."
-  fi
-
-  ensure_winepulse_capture_patch_applied "$src_dir"
-  say "Continuing to build with verified WinePulse capture-buffer patch."
-  
-  run_as_user mkdir -p "$build_dir"
-  force_winepulse_rebuild_cache "$src_dir" "$build_dir"
-  clean_rtsp_redist_outputs "$build_dir" "$archive"
-
-  local build_jobs
-  build_jobs="$(proton_build_jobs)"
-
-  say "Building Proton redist tarball with CPU limit: $build_jobs job(s)."
-  say "Detected system threads: $(nproc 2>/dev/null || getconf _NPROCESSORS_ONLN 2>/dev/null || printf 'unknown')"
-  say "Override with PROTON_BUILD_MAX_THREADS=N if needed."
-
-  if ! run_proton_redist_build "$src_dir" "$build_dir" "$build_jobs"; then
-    warn "Proton build failed. Last build log lines:"
-    run_in_user_shell "tail -180 '$build_dir/log' 2>/dev/null || true" >&2 || true
-    die "Could not build Proton redist tarball."
-  fi
-
-  [[ -f "$archive" ]] || die "Build finished but tarball was not found: $archive"
-
-  if ! verify_archive_contains_winepulse_patch "$archive"; then
-    warn "Incremental build reused stale WinePulse outputs."
-    warn "Cleaning build directory only, keeping source/submodules, then rebuilding once."
-
-    run_as_user rm -rf "$build_dir"
-    run_as_user mkdir -p "$build_dir"
-    force_winepulse_rebuild_cache "$src_dir" "$build_dir"
-    clean_rtsp_redist_outputs "$build_dir" "$archive"
-
-    if ! run_proton_redist_build "$src_dir" "$build_dir" "$build_jobs"; then
-      warn "Clean build-dir rebuild failed. Last build log lines:"
-      run_in_user_shell "tail -180 '$build_dir/log' 2>/dev/null || true" >&2 || true
-      die "Could not build Proton redist tarball after cleaning build directory."
-    fi
-
-    [[ -f "$archive" ]] || die "Clean build-dir rebuild finished but tarball was not found: $archive"
-    verify_archive_contains_winepulse_patch "$archive" || die "Built archive is still missing the WinePulse capture-buffer patch after clean build-dir rebuild."
-  fi
-
-  say "Installing built Proton into $dest"
-  run_as_user tar -xf "$archive" -C "$dest"
-
-  [[ -d "$current_dir" ]] || die "Install finished but compatibility tool directory was not found: $current_dir"
-
-  if grep -q 'AELORIA_VRC_CAPTURE_BUFFER_MS_PATCH_V2_FUNC' "$src_dir/wine/dlls/winepulse.drv/pulse.c" \
-    && grep -q 'AELORIA_VRC_CAPTURE_BUFFER_MS_PATCH_V2_USE' "$src_dir/wine/dlls/winepulse.drv/pulse.c" \
-    && grep -R -a -q 'WINEPULSE_CAPTURE_BUFFER_MS' "$current_dir/files/lib/wine" 2>/dev/null; then
-    say "Verified installed Proton contains WinePulse capture-buffer patch."
-  else
-    warn "Installed Proton does not contain the verified WinePulse capture-buffer patch."
-    warn "Removing broken install so Steam cannot use it."
-    run_as_user rm -rf "$current_dir"
-    die "Built Proton is missing the WinePulse capture-buffer patch."
-  fi
-
-  say "Installed local Proton build: $RTSP_TOOL_NAME"
-}
-
 fetch_rtsp_release() {
-  if [[ "${RTSP_BUILD_FROM_SOURCE:-0}" == "1" ]]; then
-    set_local_rtsp_build_release_info
-  else
-    fetch_github_release "$RTSP_REPO" rtsp
-  fi
+  fetch_github_release "$RTSP_REPO" rtsp
 }
 
 fetch_wayvr_release() {
@@ -1163,11 +722,6 @@ verify_rtsp_archive() {
 
 install_rtsp() {
   local force="${1:-0}"
-
-  if [[ "${RTSP_BUILD_FROM_SOURCE:-0}" == "1" ]]; then
-    build_install_rtsp_from_source "$force"
-    return
-  fi
 
   fetch_rtsp_release
   detect_steam
@@ -1778,25 +1332,7 @@ update_mode() {
     local existing_rtsp=""
     existing_rtsp="$(installed_rtsp_versions || true)"
 
-    if [[ "${RTSP_BUILD_FROM_SOURCE:-0}" == "1" ]]; then
-      if [[ -d "$rtsp_dest" ]]; then
-        say "Local Proton build is already installed: $RTSP_TOOL_NAME"
-        if prompt_yes_no "Rebuild/reinstall it from $RTSP_SOURCE_REF now?" "Y"; then
-          if ensure_steam_closed_for_update; then
-            install_rtsp 1
-            configure_steam_for_vrchat
-          fi
-        fi
-      else
-        say "Local Proton build is not installed yet: $RTSP_TOOL_NAME"
-        if prompt_yes_no "Build/install it from $RTSP_SOURCE_REF now?" "Y"; then
-          if ensure_steam_closed_for_update; then
-            install_rtsp
-            configure_steam_for_vrchat
-          fi
-        fi
-      fi
-    elif [[ -d "$rtsp_dest" ]]; then
+    if [[ -d "$rtsp_dest" ]]; then
       say "Proton-GE-RTSP is already at the latest detected version: $RTSP_TAG"
     else
       if [[ -n "$existing_rtsp" ]]; then
