@@ -1173,6 +1173,22 @@ if launch_opts != '__SKIP__':
 PY
 }
 
+unlock_rtsp_h264() {
+  [[ "$RTSP_TAG" == proton-rtsp-11.* ]] || return 0
+
+  say "Applying Steam H.264 unlock required by $RTSP_TAG..."
+
+  if [[ "$STEAM_KIND" == "flatpak" ]]; then
+    run_in_user_shell "nohup flatpak run '$STEAM_FLATPAK_ID' 'steam://unlockh264/' >/dev/null 2>&1 &" || warn "Could not apply Steam H.264 unlock automatically."
+  elif have steam; then
+    run_in_user_shell "nohup steam 'steam://unlockh264/' >/dev/null 2>&1 &" || warn "Could not apply Steam H.264 unlock automatically."
+  elif have steam-launcher; then
+    run_in_user_shell "nohup steam-launcher 'steam://unlockh264/' >/dev/null 2>&1 &" || warn "Could not apply Steam H.264 unlock automatically."
+  else
+    warn "Could not find a Steam launcher for the H.264 unlock."
+  fi
+}
+
 configure_steam_for_vrchat() {
   detect_steam
   [[ -n "$STEAM_ROOT" ]] || die "Steam was not detected."
@@ -1348,6 +1364,7 @@ update_mode() {
 
           if prompt_yes_no "Update Steam's VRChat compatibility selection to $RTSP_TAG now?" "Y"; then
             configure_steam_for_vrchat
+            unlock_rtsp_h264
           fi
         fi
       fi
@@ -1480,6 +1497,7 @@ full_install() {
   close_steam_for_setup
   install_rtsp
   configure_steam_for_vrchat
+  unlock_rtsp_h264
   ensure_wayvr
   launch_post_install_helpers
   create_helper_notes
@@ -1521,6 +1539,7 @@ repair_install() {
 
   if prompt_yes_no "Apply or re-apply the optimal VRChat Steam compatibility and launch-option settings now?" "Y"; then
     configure_steam_for_vrchat
+    unlock_rtsp_h264
   fi
 
   if [[ -x "$WAYVR_BIN" ]]; then
